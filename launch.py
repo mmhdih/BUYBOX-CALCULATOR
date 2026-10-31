@@ -17,15 +17,42 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parent
 
 
-def free_port(start: int = 8501, tries: int = 50) -> int:
-    """First free TCP port on localhost starting at ``start``."""
-    for port in range(start, start + tries):
+#: Dedicated default port — deliberately not Streamlit's 8501, which other internal
+#: Streamlit tools (e.g. DK ATP) use. Override with the BUYBOX_PORT environment variable.
+DEFAULT_PORT = 8642
+
+
+def port_is_free(port: int) -> bool:
+    """True when nothing listens on ``port`` and it can be bound.
+
+    Checks a connection first: on Windows a bind to 127.0.0.1 can succeed even while another
+    program listens on 0.0.0.0 with the same port, which would make the two apps collide.
+    """
+    for host in ("127.0.0.1", "::1"):
+        fam = socket.AF_INET6 if ":" in host else socket.AF_INET
+        try:
+            with socket.socket(fam, socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                if s.connect_ex((host, port)) == 0:
+                    return False
+        except OSError:
+            pass
+    for host in ("0.0.0.0", "127.0.0.1"):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):  # Windows
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             try:
-                s.bind(("127.0.0.1", port))
-                return port
+                s.bind((host, port))
             except OSError:
-                continue
+                return False
+    return True
+
+
+def free_port(start: int = DEFAULT_PORT, tries: int = 50) -> int:
+    """First free TCP port starting at ``start``."""
+    for port in range(start, start + tries):
+        if port_is_free(port):
+            return port
     raise SystemExit("No free port found between %d and %d." % (start, start + tries))
 
 

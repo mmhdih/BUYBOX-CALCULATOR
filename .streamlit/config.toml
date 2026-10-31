@@ -1,7 +1,8 @@
 [server]
 # Local only: the data is internal and must not leave this computer.
 address = "localhost"
-port = 8501
+# Dedicated port (not the default 8501, used by other internal Streamlit apps such as DK ATP).
+port = 8642
 headless = true
 enableStaticServing = true
 maxUploadSize = 300

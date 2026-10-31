@@ -142,7 +142,9 @@ def delta_args(pp: object) -> dict:
     """st.metric delta kwargs for a percentage-point change (neutral colour when ~0)."""
     if pp is None or pd.isna(pp):
         return {}
-    return {"delta": fmt_pp(pp), "delta_color": "off" if abs(float(pp)) < 0.05 else "normal"}
+    if abs(float(pp)) < 0.05:
+        return {"delta": fmt_pp(pp), "delta_color": "off", "delta_arrow": "off"}
+    return {"delta": fmt_pp(pp), "delta_color": "normal"}
 
 
 def fmt_weight(v: object) -> str:
@@ -169,40 +171,98 @@ def change_bg(v: object) -> str:
     return f"background-color: {BG_GREEN}" if v >= 5 else f"background-color: {BG_RED}" if v <= -5 else ""
 
 
-def styled(df: pd.DataFrame, pct=(), ints=(), pp=(), weight=(), ratio=(), rate_cols=(), change_cols=(),
-           ids=()):
-    """Styler with thousands separators, 1-decimal percents and optional color rules."""
-    d = df.copy()
-    for c in ids:
-        if c in d.columns:
-            d[c] = d[c].astype("string").fillna("")
-    fmt = {}
-    for c in d.columns:
+def _fmt_id(v: object) -> str:
+    if v is None or pd.isna(v):
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _fmt_auto(v: object) -> tuple[str, bool]:
+    """Format an unspecified value; returns (text, is_number)."""
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return "-", True
+    if isinstance(v, bool):
+        return ("✓" if v else ""), False
+    if isinstance(v, (int,)) or (hasattr(v, "dtype") and pd.api.types.is_integer_dtype(getattr(v, "dtype", None))):
+        return f"{int(v):,}", True
+    if isinstance(v, float):
+        return (f"{v:,.0f}" if v.is_integer() else f"{v:,.4g}"), True
+    return str(v), False
+
+
+def rtl_table(df: pd.DataFrame, pct=(), ints=(), pp=(), weight=(), ratio=(), rate_cols=(), change_cols=(),
+              ids=(), height: int | None = None, max_rows: int = 2000, total_mask: pd.Series | None = None,
+              wrap_cols=()) -> None:
+    """Render a read-only right-to-left HTML table.
+
+    Columns start on the right, the header and the first column are sticky, numbers are
+    isolated left-to-right (so % and − sit correctly) and cells can be colour-coded.
+    """
+    import html as _html
+
+    if df.empty:
+        st.caption("— بدون ردیف —")
+        return
+    shown = df.head(max_rows)
+    tot = (total_mask.reindex(shown.index).fillna(False).to_numpy() if total_mask is not None
+           else [False] * len(shown))
+    fixed: dict[str, object] = {}
+    for c in shown.columns:
         if c in pct:
-            fmt[c] = fmt_pct
+            fixed[c] = fmt_pct
         elif c in ints:
-            fmt[c] = fmt_int
+            fixed[c] = fmt_int
         elif c in pp:
-            fmt[c] = fmt_pp
+            fixed[c] = fmt_pp
         elif c in weight:
-            fmt[c] = fmt_weight
+            fixed[c] = fmt_weight
         elif c in ratio:
-            fmt[c] = lambda v: "-" if pd.isna(v) else f"{v:.2f}"
-    sty = d.style.format(fmt, na_rep="-")
-    rc = [c for c in rate_cols if c in d.columns]
-    cc = [c for c in change_cols if c in d.columns]
-    if rc:
-        sty = sty.map(rate_bg, subset=rc)
-    if cc:
-        sty = sty.map(change_bg, subset=cc)
-    return sty
+            fixed[c] = lambda v: "-" if v is None or pd.isna(v) else f"{v:.2f}"
+        elif c in ids:
+            fixed[c] = _fmt_id
+    cols_html: list[list[str]] = []
+    for c in shown.columns:
+        vals = shown[c].tolist()
+        f = fixed.get(c)
+        bg = rate_bg if c in rate_cols else change_bg if c in change_cols else None
+        cells = []
+        for v in vals:
+            if f is not None:
+                text, num = f(v), True
+            else:
+                text, num = _fmt_auto(v)
+            cls = "n" if num else ("w" if c in wrap_cols else "t")
+            style = ""
+            if bg is not None:
+                css = bg(v)
+                style = f' style="{css}"' if css else ""
+            esc = _html.escape(text)
+            title = f' title="{esc}"' if cls == "t" and len(text) > 40 else ""
+            cells.append(f'<td class="{cls}"{style}{title}>{esc}</td>')
+        cols_html.append(cells)
+    head = "".join(f"<th>{_html.escape(str(c))}</th>" for c in shown.columns)
+    body = []
+    for i in range(len(shown)):
+        row_cls = ' class="tot"' if tot[i] else ""
+        body.append(f"<tr{row_cls}>" + "".join(col[i] for col in cols_html) + "</tr>")
+    h = f"max-height:{height}px;" if height else ""
+    st.markdown(
+        f'<div class="bb-tw" style="{h}"><table class="bb-t"><thead><tr>{head}</tr></thead>'
+        f'<tbody>{"".join(body)}</tbody></table></div>',
+        unsafe_allow_html=True,
+    )
+    if len(df) > max_rows:
+        st.caption(bidi(f"فقط {fmt_int(max_rows)} ردیف اول از {fmt_int(len(df))} ردیف نمایش داده شد؛ "
+                        "همه ردیف‌ها در فایل اکسل خروجی هست."))
 
 
-def row_table(rows: pd.DataFrame, extra: tuple[str, ...] = ()) -> object:
+def row_table(rows: pd.DataFrame, extra: tuple[str, ...] = (), height: int | None = None) -> None:
     cols = [c for c in (*ROW_VIEW_COLUMNS, *extra) if c in rows.columns]
-    return styled(rows[cols], pct=("Gap_to_BuyBox", "Required_Cut_%"),
-                  ints=("Selling_Price", "BuyBox_Min_Price", "Target_Price"), weight=("Weight",),
-                  ids=("DKPC", "DKP", "Seller_ID"))
+    rtl_table(rows[cols], pct=("Gap_to_BuyBox", "Required_Cut_%"),
+              ints=("Selling_Price", "BuyBox_Min_Price", "Target_Price"), weight=("Weight",),
+              ids=("DKPC", "DKP", "Seller_ID"), height=height)
 
 
 def inject_css() -> None:
@@ -224,12 +284,60 @@ button, .stTabs [data-baseweb="tab"], [data-testid="stMetricLabel"], [data-testi
 [data-testid="stIconMaterial"], .material-symbols-rounded, span[class*="material"] {
   font-family: 'Material Symbols Rounded' !important;
 }
-.stApp, [data-testid="stSidebar"], [data-testid="stMain"] { direction: rtl; text-align: right; }
-[data-testid="stDataFrame"], [data-testid="stTable"], .js-plotly-plot, code, pre { direction: ltr; text-align: left; }
-[data-testid="stMetricValue"], [data-testid="stMetricDelta"] { direction: ltr; text-align: right; justify-content: flex-end; }
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] { text-align: right; }
+/* ---------- right-to-left layout ---------- */
+.stApp, [data-testid="stSidebar"], [data-testid="stMain"], [data-testid="stBottom"] { direction: rtl; }
+/* Streamlit sets text-align:left on these; force right */
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+.stApp [data-testid="stHeadingWithActionElements"],
+.stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stMarkdownContainer"] p,
+.stApp [data-testid="stMarkdownContainer"] li, .stApp [data-testid="stCaptionContainer"],
+.stApp [data-testid="stCaptionContainer"] p, .stApp label, .stApp [data-testid="stWidgetLabel"],
+.stApp [data-testid="stWidgetLabel"] p, .stApp [data-testid="stAlertContainer"] p,
+.stApp [data-testid="stExpander"] summary, .stApp [data-testid="stMetricLabel"],
+.stApp [data-testid="stMetricLabel"] p, .stApp [data-testid="stTooltipContent"] {
+  text-align: right !important; direction: rtl;
+}
+.stApp [data-testid="stHeadingWithActionElements"] > * { justify-content: flex-start; }
+.stApp [data-testid="stMarkdownContainer"] ul, .stApp [data-testid="stMarkdownContainer"] ol {
+  padding-right: 1.3rem !important; padding-left: 0 !important; margin-right: 0 !important;
+}
+/* metric value + delta: numbers LTR but placed on the right */
+.stApp [data-testid="stMetricValue"], .stApp [data-testid="stMetricValue"] > div {
+  direction: ltr; text-align: right !important; justify-content: flex-end !important;
+}
+.stApp [data-testid="stMetric"] { text-align: right; }
+.stApp [data-testid="stMetricDelta"] { direction: ltr; justify-content: flex-end; margin-left: auto; width: fit-content; }
+.stApp [data-testid="stMetricDelta"], .stApp [data-testid="stMetricDelta"] * { direction: ltr !important; }
+/* file uploader: Persian texts instead of Streamlit's English ones */
+.stApp [data-testid="stFileUploaderDropzoneInstructions"] * { display: none !important; }
+.stApp [data-testid="stFileUploaderDropzoneInstructions"]::after {
+  content: "فایل xlsx — حداکثر ۳۰۰ مگابایت"; font-size: 0.8rem; color: #6B7280; }
+.stApp [data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"] > * { display: none !important; }
+.stApp [data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"]::after {
+  content: "انتخاب فایل"; font-size: 0.9rem; }
+/* sliders and number boxes keep LTR mechanics (min on the left, typed digits LTR) */
+.stApp [data-testid="stSlider"] [data-baseweb="slider"], .stApp [data-testid="stSliderThumbValue"],
+.stApp [data-testid="stSliderTickBar"] { direction: ltr; }
+.stApp [data-testid="stNumberInput"] input { direction: ltr; text-align: right; }
+.stApp [data-testid="stNumberInputContainer"] { direction: ltr; }
+.js-plotly-plot, code, pre { direction: ltr; text-align: left; }
 .stTabs [data-baseweb="tab-list"] { gap: 0.25rem; flex-wrap: wrap; }
 div[data-testid="stExpander"] summary p { font-weight: 600; }
+/* ---------- RTL tables ---------- */
+.bb-tw { overflow: auto; direction: rtl; border: 1px solid #E3E6EC; border-radius: 8px; margin: 0.25rem 0 0.75rem; }
+.bb-t { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 0.84rem; direction: rtl; }
+.bb-t th { position: sticky; top: 0; z-index: 2; background: #1F4E78; color: #fff; font-weight: 600;
+  padding: 7px 10px; text-align: right; white-space: nowrap; }
+.bb-t td { padding: 5px 10px; border-bottom: 1px solid #EEF0F4; text-align: right; white-space: nowrap;
+  background: #fff; }
+.bb-t tbody tr:nth-child(even) td { background: #F8F9FB; }
+.bb-t tbody tr:hover td { background: #EEF4FB; }
+.bb-t td.n { direction: ltr; unicode-bidi: isolate; text-align: right; font-variant-numeric: tabular-nums; }
+.bb-t td.t { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+.bb-t td.w { white-space: normal; min-width: 160px; }
+.bb-t th:first-child, .bb-t td:first-child { position: sticky; right: 0; z-index: 1; box-shadow: -1px 0 0 #E3E6EC; }
+.bb-t th:first-child { z-index: 3; }
+.bb-t tr.tot td { font-weight: 700; background: #D9E1F2 !important; border-top: 2px solid #1F4E78; }
 .bb-chip { display:inline-block; padding:0.1rem 0.55rem; border-radius:999px; font-size:0.8rem; margin-left:0.3rem; }
 .bb-ok { background:#C6EFCE; color:#006100; } .bb-warn { background:#FFEB9C; color:#9C5700; }
 .bb-info { background:#DDEBF7; color:#1F4E78; }
@@ -295,10 +403,13 @@ def seller_bar_chart(table: pd.DataFrame) -> None:
                  color_discrete_map={"<30%": RED, "30–60%": AMBER, ">60%": GREEN},
                  text=t["Comp_Win_Rate"].map(fmt_pct),
                  category_orders={"band": ["<30%", "30–60%", ">60%"]})
-    fig.update_layout(height=max(360, 26 * len(t) + 80), margin=dict(l=10, r=10, t=30, b=10),
-                      xaxis=dict(tickformat=".0%", range=[0, 1.08], title="وین‌ریت رقابتی"),
-                      yaxis=dict(title="", categoryorder="array", categoryarray=list(t["label"])),
-                      legend_title_text="", font=dict(family="Vazirmatn, VazirmatnLocal, Tahoma"))
+    # right-to-left: bars grow from the right, seller names on the right axis
+    fig.update_layout(height=max(360, 26 * len(t) + 80), margin=dict(l=10, r=10, t=40, b=10),
+                      xaxis=dict(tickformat=".0%", range=[1.12, 0], title="وین‌ریت رقابتی"),
+                      yaxis=dict(title="", side="right", categoryorder="array", categoryarray=list(t["label"])),
+                      legend=dict(orientation="h", x=1, xanchor="right", y=1.02, yanchor="bottom",
+                                  title_text="", traceorder="normal"),
+                      font=dict(family="Vazirmatn, VazirmatnLocal, Tahoma"))
     fig.update_traces(textposition="outside", cliponaxis=False)
     st.plotly_chart(fig, width="stretch")
     st.caption("۲۰ فروشنده با بیشترین تنوع در رقابت (عدد داخل پرانتز). قرمز < ۳۰٪، کهربایی ۳۰ تا ۶۰٪، سبز > ۶۰٪.")
@@ -365,9 +476,8 @@ def quality_section(checks, compact: bool) -> None:
         else:
             st.markdown(line, unsafe_allow_html=True)
             with st.expander(f"مشاهده ردیف‌ها — {chk.label}"):
-                st.dataframe(styled(chk.rows.head(5000), ints=("Selling_Price", "BuyBox_Min_Price"),
-                                    weight=("Weight",), ids=("DKPC", "DKP", "Seller_ID", "Group_ID")),
-                             hide_index=True, width="stretch")
+                rtl_table(chk.rows.head(5000), ints=("Selling_Price", "BuyBox_Min_Price"),
+                                    weight=("Weight",), ids=("DKPC", "DKP", "Seller_ID", "Group_ID"))
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +724,17 @@ def main() -> None:
     with tabs[1]:
         show_cols = [c for c in L.SELLER_COLUMNS if c in table.columns]
         disp = table[show_cols].rename(columns=L.SELLER_COLUMNS)
-        sty = styled(
+        sort_opts = {L.SELLER_COLUMNS[c]: c for c in show_cols if c not in ("Seller_ID", "Seller_Name", "KAM", "Main_Brand")}
+        sc1, sc2, _ = st.columns([2, 1, 3])
+        sort_by = sc1.selectbox("مرتب‌سازی بر اساس", list(sort_opts), index=0, key="seller_sort")
+        ascending = sc2.radio("ترتیب", ["نزولی", "صعودی"], horizontal=True, key="seller_order") == "صعودی"
+        body = table[~table["Is_Total"]].sort_values(sort_opts[sort_by], ascending=ascending, na_position="last")
+        ordered = pd.concat([body, table[table["Is_Total"]]])
+        disp_cols = ["Seller_Name", "Seller_ID"] + [c for c in show_cols if c not in ("Seller_ID", "Seller_Name")]
+        disp = ordered[disp_cols].rename(columns=L.SELLER_COLUMNS)
+        st.caption("سطر آخر «جمع کل» تجمیعی است (مجموع بردها ÷ مجموع تنوع‌ها، نه میانگین درصدها). "
+                   "برای جزئیات هر فروشنده، آن را از فهرست زیر جدول انتخاب کنید.")
+        rtl_table(
             disp,
             pct=[L.SELLER_COLUMNS[c] for c in ("Win_Rate", "Comp_Win_Rate", "Prev_Comp_Win_Rate",
                                                  "Median_Loss_Gap", "Share")],
@@ -624,21 +744,10 @@ def main() -> None:
             pp=[L.SELLER_COLUMNS["Comp_Win_Rate_Change"]],
             rate_cols=[L.SELLER_COLUMNS["Comp_Win_Rate"]],
             change_cols=[L.SELLER_COLUMNS["Comp_Win_Rate_Change"]],
-            ids=["Seller_ID"],
+            ids=["Seller_ID"], height=460, total_mask=ordered["Is_Total"].reset_index(drop=True)
+            .set_axis(disp.index), max_rows=5000,
         )
-        st.caption("برای دیدن جزئیات، روی یک ردیف کلیک کنید یا فروشنده را از فهرست پایین انتخاب کنید. "
-                   "سطر آخر «جمع کل» تجمیعی است.")
-        event = st.dataframe(sty, hide_index=True, width="stretch", on_select="rerun",
-                             selection_mode="single-row", key="seller_table", height=420,
-                             column_config={"Seller_ID": st.column_config.Column(pinned=True),
-                                            "Seller Name": st.column_config.Column(pinned=True)})
-        sel_rows = event.selection.rows if event is not None else []
-        data_ids = table.loc[~table["Is_Total"], "Seller_ID"].tolist()
-        if sel_rows:
-            picked = table.iloc[sel_rows[0]]
-            if not picked["Is_Total"] and st.session_state.get("last_pick") != picked["Seller_ID"]:
-                st.session_state["drill"] = picked["Seller_ID"]
-                st.session_state["last_pick"] = picked["Seller_ID"]
+        data_ids = body["Seller_ID"].tolist()
         if st.session_state.get("drill") not in data_ids:
             st.session_state.pop("drill", None)
         sid = st.selectbox("فروشنده برای جزئیات", data_ids, key="drill",
@@ -654,16 +763,17 @@ def main() -> None:
         if nm.empty:
             st.info("در داده فیلترشده باخت نزدیکی وجود ندارد.")
         else:
-            counts = (nm.groupby("Seller_ID").agg(n=("DKPC", "size"),
-                                                   flags=("Margin_Flag", lambda x: int((x != "").sum())))
-                      .sort_values("n", ascending=False))
+            counts = (nm.groupby("Seller_ID").agg(n_rows=("DKPC", "size"),
+                                                   n_margin=("Margin_Flag", lambda x: int((x != "").sum())))
+                      .sort_values("n_rows", ascending=False))
             st.markdown(f"**{fmt_int(len(nm))} باخت نزدیک در {fmt_int(len(counts))} فروشنده**")
             for seller_id, rec in counts.iterrows():
                 name = info.at[seller_id, "Seller_Name"] if seller_id in info.index else str(seller_id)
                 srows = nm[nm["Seller_ID"] == seller_id].sort_values("Gap_to_BuyBox")
-                with st.expander(f"{name} — {fmt_int(rec.n)} تنوع" +
-                                 (f" (هشدار حاشیه: {rec.flags})" if rec.flags else "")):
-                    st.dataframe(row_table(srows), hide_index=True, width="stretch")
+                n_margin = int(rec["n_margin"])
+                with st.expander(bidi(f"{name} — {fmt_int(rec['n_rows'])} تنوع" +
+                                      (f" (هشدار حاشیه: {n_margin})" if n_margin else ""))):
+                    row_table(srows, height=380)
 
                     def _qw(r=srows, n=name) -> bytes:
                         return build_quickwin_workbook(r, n, params)
@@ -709,21 +819,21 @@ def seller_drilldown(rows: pd.DataFrame, table: pd.DataFrame, sid: object, info:
         if ltw.empty:
             st.caption("باخت رقابتی ندارد.")
         else:
-            st.dataframe(styled(ltw.rename(columns={"BuyBox_Winner_Seller": "برنده بای باکس", "Count": "تعداد"}),
-                                ints=("تعداد",)), hide_index=True, width="stretch")
+            rtl_table(ltw.rename(columns={"BuyBox_Winner_Seller": "برنده بای باکس", "Count": "تعداد"}),
+                                ints=("تعداد",))
     with r:
         nm = srows[srows["Near_Miss"]].sort_values("Gap_to_BuyBox")
         st.markdown(f"**باخت‌های نزدیک ({fmt_int(len(nm))})**")
         if nm.empty:
             st.caption("باخت نزدیکی ندارد.")
         else:
-            st.dataframe(row_table(nm), hide_index=True, width="stretch", height=250)
+            row_table(nm, height=250)
     lost = srows[srows["Is_Loss"]].sort_values("Gap_to_BuyBox")
     st.markdown(f"**همه بای باکس‌های ازدست‌رفته ({fmt_int(len(lost))})** — "
                 "ستون Margin_Flag نشان می‌دهد کاهش قیمت لازم از حد قابل قبول بیشتر است.")
     if not lost.empty:
         extra = ("Competition_Type", "BuyBox_Change") if "BuyBox_Change" in lost.columns else ("Competition_Type",)
-        st.dataframe(row_table(lost, extra), hide_index=True, width="stretch", height=320)
+        row_table(lost, extra, height=320)
 
 
 def changes_tab(rows, prev_f, comparison, mk, changes, info, rows_all) -> None:
@@ -741,12 +851,12 @@ def changes_tab(rows, prev_f, comparison, mk, changes, info, rows_all) -> None:
     rename = {"Seller_Name": "فروشنده", "Gained": "گرفته", "Lost": "از دست رفته", "Net": "خالص"}
     with a:
         st.markdown("**۵ برنده خالص اول**")
-        st.dataframe(styled(winners.rename(columns=rename), ints=("گرفته", "از دست رفته", "خالص"),
-                            ids=("Seller_ID",)), hide_index=True, width="stretch")
+        rtl_table(winners.rename(columns=rename), ints=("گرفته", "از دست رفته", "خالص"),
+                            ids=("Seller_ID",))
     with b:
         st.markdown("**۵ بازنده خالص اول**")
-        st.dataframe(styled(losers.rename(columns=rename), ints=("گرفته", "از دست رفته", "خالص"),
-                            ids=("Seller_ID",)), hide_index=True, width="stretch")
+        rtl_table(losers.rename(columns=rename), ints=("گرفته", "از دست رفته", "خالص"),
+                            ids=("Seller_ID",))
 
     st.markdown("**تغییرات به تفکیک فروشنده**")
     prev_comp = compare.prev_comp_by_seller(prev_f)
@@ -759,14 +869,13 @@ def changes_tab(rows, prev_f, comparison, mk, changes, info, rows_all) -> None:
     t["Seller_Name"] = info["Seller_Name"].reindex(t.index)
     t = t.reset_index()[["Seller_ID", "Seller_Name", "Prev_Rate", "Cur_Rate", "Change_pp", "Gained", "Lost", "Net", "New"]]
     t = t.sort_values(["Net", "Lost"], ascending=[True, False])
-    st.dataframe(styled(t.rename(columns={"Seller_Name": "فروشنده", "Prev_Rate": "وین‌ریت رقابتی قبل",
+    rtl_table(t.rename(columns={"Seller_Name": "فروشنده", "Prev_Rate": "وین‌ریت رقابتی قبل",
                                           "Cur_Rate": "وین‌ریت رقابتی فعلی", "Change_pp": "تغییر",
                                           "Gained": "گرفته", "Lost": "از دست رفته", "Net": "خالص",
                                           "New": "تنوع جدید"}),
                         pct=("وین‌ریت رقابتی قبل", "وین‌ریت رقابتی فعلی"), pp=("تغییر",),
                         ints=("گرفته", "از دست رفته", "خالص", "تنوع جدید"), change_cols=("تغییر",),
-                        ids=("Seller_ID",)),
-                 hide_index=True, width="stretch", height=380)
+                        ids=("Seller_ID",), height=380)
 
     st.markdown("**ردیف‌های تغییرکرده**")
     kinds = [L.CHANGE_GAINED, L.CHANGE_LOST, L.CHANGE_NEW, L.CHANGE_NO_WEIGHT, L.CHANGE_SAME, L.CHANGE_BAD_PRICE]
@@ -775,14 +884,14 @@ def changes_tab(rows, prev_f, comparison, mk, changes, info, rows_all) -> None:
     cols = [c for c in ("DKPC", "DKP", "Seller_Name", "Product_Name", "Weight", "Selling_Price", "BuyBox_Min_Price",
                         "BuyBox_Winner_Seller", "Comment_Prev_File", "Comment", "BuyBox_Change") if c in ch_rows.columns]
     st.caption(f"{fmt_int(len(ch_rows))} ردیف (حداکثر ۵٬۰۰۰ ردیف نمایش داده می‌شود)")
-    st.dataframe(styled(ch_rows[cols].head(5000), ints=("Selling_Price", "BuyBox_Min_Price"), weight=("Weight",),
-                        ids=("DKPC", "DKP")), hide_index=True, width="stretch", height=360)
+    rtl_table(ch_rows[cols].head(5000), ints=("Selling_Price", "BuyBox_Min_Price"), weight=("Weight",),
+                        ids=("DKPC", "DKP"), height=360)
 
     removed = compare.removed_rows(rows_all, prev_f)
     st.markdown(f"**تنوع‌های حذف‌شده (در فایل قبل بودند، در فایل فعلی نیستند): {fmt_int(len(removed))}**")
     if not removed.empty:
-        st.dataframe(styled(removed.head(5000), ints=("Selling_Price",), weight=("Weight",),
-                            ids=("DKPC", "DKP", "Seller_ID")), hide_index=True, width="stretch", height=300)
+        rtl_table(removed.head(5000), ints=("Selling_Price",), weight=("Weight",),
+                            ids=("DKPC", "DKP", "Seller_ID"), height=300)
 
 
 def category_tab(rows: pd.DataFrame) -> None:
@@ -798,18 +907,16 @@ def category_tab(rows: pd.DataFrame) -> None:
             if t.empty:
                 st.caption(f"ستون {col} در فایل نیست.")
                 continue
-            st.dataframe(styled(t.rename(columns=rename), pct=("وین‌ریت رقابتی", "میانه فاصله باخت‌ها"),
-                                ints=ints, rate_cols=("وین‌ریت رقابتی",)),
-                         hide_index=True, width="stretch", height=360)
+            rtl_table(t.rename(columns=rename), pct=("وین‌ریت رقابتی", "میانه فاصله باخت‌ها"),
+                                ints=ints, rate_cols=("وین‌ریت رقابتی",), height=360)
     st.markdown("**گروه‌های تک‌فروشنده — DKPهای پرتنوع (کاندید جذب فروشنده دوم)**")
     t = single_seller_dkps(rows, top=50)
     if t.empty:
         st.caption("گروه تک‌فروشنده‌ای وجود ندارد.")
     else:
-        st.dataframe(styled(t.rename(columns={"Variants": "تنوع تک‌فروشنده", "Weights": "تعداد وزن",
+        rtl_table(t.rename(columns={"Variants": "تنوع تک‌فروشنده", "Weights": "تعداد وزن",
                                               "Sellers": "فروشنده(ها)"}),
-                            ints=("تنوع تک‌فروشنده", "تعداد وزن"), ids=("DKP",)),
-                     hide_index=True, width="stretch", height=380)
+                            ints=("تنوع تک‌فروشنده", "تعداد وزن"), ids=("DKP",), height=380)
 
 
 if __name__ == "__main__":

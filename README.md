@@ -18,7 +18,9 @@
 2. کل zip را Extract کنید (روی دسکتاپ، درایو دیگر یا فلش).
 3. روی `BuyBox.bat` دوبار کلیک کنید. مرورگر خودکار باز می‌شود. برای بستن، پنجره سیاه را ببندید.
 
-نیازی به نصب پایتون یا دسترسی ادمین نیست. تاریخچه اجراها، تنظیمات و آخرین لیست KAM در
+نیازی به نصب پایتون یا دسترسی ادمین نیست. برنامه روی پورت **8642** اجرا می‌شود (نه 8501 که پیش‌فرض Streamlit
+و اپ‌هایی مثل DK ATP است)، پس هر دو هم‌زمان باز می‌مانند؛ اگر 8642 هم اشغال باشد، پورت آزاد بعدی انتخاب می‌شود.
+برای پورت دلخواه، متغیر محیطی `BUYBOX_PORT` را تنظیم کنید. تاریخچه اجراها، تنظیمات و آخرین لیست KAM در
 `app\data` ذخیره می‌شود؛ برای رفتن به نسخه جدید همین پوشه را کپی کنید.
 
 ### ۲. اجرا با پایتون (برای توسعه)
@@ -28,7 +30,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-یا `python launch.py` (پورت آزاد را خودش پیدا می‌کند و مرورگر را باز می‌کند).
+یا `python launch.py` (از پورت 8642 شروع می‌کند، پورت آزاد را خودش پیدا می‌کند و مرورگر را باز می‌کند).
 
 ### ۳. ساخت نسخه پرتابل
 
@@ -75,6 +77,8 @@ python portable/build_portable.py
 
 - **Portable Windows build:** extract `BuyBoxAnalyzer_portable_win64.zip`, double-click `BuyBox.bat`.
   Contains the official embeddable Python 3.12 + all dependencies; no install, no admin rights.
+  Runs on port **8642** (not Streamlit's default 8501, used by other internal apps such as DK ATP);
+  falls back to the next free port, or set `BUYBOX_PORT`.
 - **From source:** `pip install -r requirements.txt` then `streamlit run app.py` (or `python launch.py`).
 - **Build the portable zip:** `python portable/build_portable.py` (any OS; fetches win_amd64 wheels).
   CI (`.github/workflows/portable.yml`) runs the tests, builds the package on `windows-latest`,

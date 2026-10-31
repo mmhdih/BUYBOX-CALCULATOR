@@ -45,19 +45,21 @@ jobs:
         shell: pwsh
         run: |
           $env:BUYBOX_NO_BROWSER = "1"
-          $env:BUYBOX_PORT = "8599"
+          # occupy 8501 like another Streamlit app (DK ATP) would, to prove there is no clash
+          $other = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, 8501); $other.Start()
           $p = Start-Process -FilePath "dist\BuyBoxAnalyzer\python\python.exe" -ArgumentList "dist\BuyBoxAnalyzer\app\launch.py" -PassThru -RedirectStandardOutput launch.out -RedirectStandardError launch.err
           $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
             try {
-              $r = Invoke-WebRequest -UseBasicParsing http://localhost:8599/_stcore/health -TimeoutSec 3
+              $r = Invoke-WebRequest -UseBasicParsing http://localhost:8642/_stcore/health -TimeoutSec 3
               if ($r.Content -eq "ok") { $ok = $true; break }
             } catch {}
           }
           Get-Content launch.out, launch.err -ErrorAction SilentlyContinue
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-          if (-not $ok) { throw "app did not become healthy" }
+          $other.Stop()
+          if (-not $ok) { throw "app did not become healthy on the default port 8642" }
           Write-Host "App started OK"
 
       - name: Upload portable package
