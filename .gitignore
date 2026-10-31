@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+data/runs/*
+!data/runs/.gitkeep
+data/settings.json
+data/kam_list_last.xlsx
+tests/fixtures/*.xlsx
+sample_data/
+dist/
+build/
+*.egg-info/
+.venv/

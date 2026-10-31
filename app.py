@@ -1,0 +1,816 @@
+"""Streamlit UI for the Buy Box Analyzer (UI only; logic lives in the ``buybox`` package)."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+APP_DIR = Path(__file__).resolve().parent
+if str(APP_DIR) not in sys.path:  # needed for the portable (embedded Python) build
+    sys.path.insert(0, str(APP_DIR))
+
+import pandas as pd  # noqa: E402
+import plotly.express as px  # noqa: E402
+import streamlit as st  # noqa: E402
+
+from buybox import compare, history  # noqa: E402
+from buybox import labels as L  # noqa: E402
+from buybox.core import (  # noqa: E402
+    Params,
+    market_summary,
+    rate_by_dimension,
+    seller_metrics,
+    single_seller_dkps,
+)
+from buybox.export import (  # noqa: E402
+    build_main_workbook,
+    build_quickwin_workbook,
+    quickwin_filename,
+    safe_filename,
+)
+from buybox.io import (  # noqa: E402
+    OPTIONAL_COLUMNS,
+    REQUIRED_COLUMNS,
+    InputFileError,
+    MappingResult,
+    detect_columns,
+    merge_kam,
+    read_excel_bytes,
+    read_kam_list,
+)
+from buybox.pipeline import Analysis, analyze, attach_comparison, filter_mask, kam_options  # noqa: E402
+from buybox.quality import STATUS_OK, STATUS_WARN, checks_to_frame, run_checks  # noqa: E402
+
+DATA_DIR = APP_DIR / "data"
+RUNS_DIR = DATA_DIR / "runs"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+KAM_SAVED = DATA_DIR / "kam_list_last.xlsx"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+RED, AMBER, GREEN = "#D64545", "#E8A33D", "#3A9D5D"
+BG_RED, BG_AMBER, BG_GREEN = "#FFC7CE", "#FFEB9C", "#C6EFCE"
+
+CANON_LABELS = {
+    "DKPC": "DKPC (شناسه تنوع)",
+    "DKP": "DKP (شناسه کالا)",
+    "Seller_ID": "Seller_ID (شناسه فروشنده)",
+    "Weight": "Weight (وزن - گرم)",
+    "Selling_Price": "Selling_Price (قیمت فروش - ریال)",
+    "Seller_Name": "Seller_Name (نام فروشنده)",
+    "Product_Name": "Product_Name (نام کالا)",
+    "Brand_Name_En": "Brand_Name_En (برند)",
+    "Leaf_Category_Name": "Leaf_Category_Name (دسته‌بندی)",
+    "True_Wage": "True_Wage (اجرت واقعی، برای هشدار حاشیه)",
+    "Actual_BuyBox": L.MAPPING_ACTUAL_BB,
+}
+
+ROW_VIEW_COLUMNS = ["DKPC", "DKP", "Product_Name", "Weight", "Selling_Price", "BuyBox_Min_Price",
+                    "BuyBox_Winner_Seller", "Gap_to_BuyBox", "Target_Price", "Required_Cut_%", "Margin_Flag"]
+
+
+# ---------------------------------------------------------------------------
+# Settings (remembered on disk, next to the app — portable friendly)
+# ---------------------------------------------------------------------------
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(settings: dict) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        st.toast("ذخیره تنظیمات ممکن نشد (دسترسی نوشتن روی پوشه data وجود ندارد).")
+
+
+# ---------------------------------------------------------------------------
+# Cached computation (keyed on file bytes + parameters)
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner="در حال خواندن فایل اکسل…", max_entries=6)
+def cached_read(data: bytes) -> pd.DataFrame:
+    return read_excel_bytes(data)
+
+
+@st.cache_data(show_spinner="در حال خواندن لیست KAM…", max_entries=4)
+def cached_kam(data: bytes) -> tuple[pd.DataFrame, list[str]]:
+    kam, warnings = read_kam_list(data)
+    return merge_kam(kam), warnings
+
+
+@st.cache_data(show_spinner="در حال محاسبه بای باکس…", max_entries=6)
+def cached_analysis(data: bytes, name: str, mapping_items: tuple, kam_bytes: bytes | None,
+                    params: tuple[float, float, float]) -> Analysis:
+    raw = cached_read(data)
+    kam = cached_kam(kam_bytes)[0] if kam_bytes else None
+    return analyze(raw, dict(mapping_items), kam, Params(*params), name)
+
+
+@st.cache_data(show_spinner="در حال بارگذاری اجرای ذخیره‌شده…", max_entries=4)
+def cached_run(path: str, mtime: float) -> pd.DataFrame:  # mtime only busts the cache
+    return history.load_run(history.RunInfo(Path(path), {}))
+
+
+def file_hash(data: bytes) -> str:
+    return hashlib.sha1(data).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+def fmt_int(v: object) -> str:
+    return "-" if v is None or pd.isna(v) else f"{float(v):,.0f}"
+
+
+def fmt_pct(v: object) -> str:
+    return "-" if v is None or pd.isna(v) else f"{float(v) * 100:.1f}%"
+
+
+def fmt_pp(v: object) -> str:
+    if v is None or pd.isna(v):
+        return "-"
+    return "0.0 pp" if abs(float(v)) < 0.05 else f"{float(v):+.1f} pp"
+
+
+def delta_args(pp: object) -> dict:
+    """st.metric delta kwargs for a percentage-point change (neutral colour when ~0)."""
+    if pp is None or pd.isna(pp):
+        return {}
+    return {"delta": fmt_pp(pp), "delta_color": "off" if abs(float(pp)) < 0.05 else "normal"}
+
+
+def fmt_weight(v: object) -> str:
+    return "-" if v is None or pd.isna(v) else f"{float(v):g}"
+
+
+_NUM_RE = re.compile(r"([+\-−]?\d[\d,]*(?:\.\d+)?(?:\s?(?:%|pp))?)")
+
+
+def bidi(text: str) -> str:
+    """Wrap numbers (incl. % / pp) in LTR isolates so they read correctly inside Persian text."""
+    return _NUM_RE.sub("\u2066\\1\u2069", text)
+
+
+def rate_bg(v: object) -> str:
+    if v is None or pd.isna(v):
+        return ""
+    return f"background-color: {BG_RED if v < 0.3 else BG_AMBER if v <= 0.6 else BG_GREEN}"
+
+
+def change_bg(v: object) -> str:
+    if v is None or pd.isna(v):
+        return ""
+    return f"background-color: {BG_GREEN}" if v >= 5 else f"background-color: {BG_RED}" if v <= -5 else ""
+
+
+def styled(df: pd.DataFrame, pct=(), ints=(), pp=(), weight=(), ratio=(), rate_cols=(), change_cols=(),
+           ids=()):
+    """Styler with thousands separators, 1-decimal percents and optional color rules."""
+    d = df.copy()
+    for c in ids:
+        if c in d.columns:
+            d[c] = d[c].astype("string").fillna("")
+    fmt = {}
+    for c in d.columns:
+        if c in pct:
+            fmt[c] = fmt_pct
+        elif c in ints:
+            fmt[c] = fmt_int
+        elif c in pp:
+            fmt[c] = fmt_pp
+        elif c in weight:
+            fmt[c] = fmt_weight
+        elif c in ratio:
+            fmt[c] = lambda v: "-" if pd.isna(v) else f"{v:.2f}"
+    sty = d.style.format(fmt, na_rep="-")
+    rc = [c for c in rate_cols if c in d.columns]
+    cc = [c for c in change_cols if c in d.columns]
+    if rc:
+        sty = sty.map(rate_bg, subset=rc)
+    if cc:
+        sty = sty.map(change_bg, subset=cc)
+    return sty
+
+
+def row_table(rows: pd.DataFrame, extra: tuple[str, ...] = ()) -> object:
+    cols = [c for c in (*ROW_VIEW_COLUMNS, *extra) if c in rows.columns]
+    return styled(rows[cols], pct=("Gap_to_BuyBox", "Required_Cut_%"),
+                  ints=("Selling_Price", "BuyBox_Min_Price", "Target_Price"), weight=("Weight",),
+                  ids=("DKPC", "DKP", "Seller_ID"))
+
+
+def inject_css() -> None:
+    st.markdown(
+        """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;600;800&display=swap');
+@font-face { font-family: 'VazirmatnLocal'; font-weight: 100 900; font-display: swap;
+  src: url('app/static/fonts/vazirmatn-arabic.woff2') format('woff2');
+  unicode-range: U+0600-06FF, U+0750-077F, U+200C-200E, U+2010-2011, U+204F, U+FB50-FDFF, U+FE70-FEFC; }
+@font-face { font-family: 'VazirmatnLocal'; font-weight: 100 900; font-display: swap;
+  src: url('app/static/fonts/vazirmatn-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC; }
+html, body, .stApp, .stMarkdown, p, li, h1, h2, h3, h4, h5, h6, label, input, textarea, select,
+button, .stTabs [data-baseweb="tab"], [data-testid="stMetricLabel"], [data-testid="stMetricValue"],
+[data-testid="stCaptionContainer"], [data-testid="stAlert"] {
+  font-family: 'Vazirmatn', 'VazirmatnLocal', Tahoma, sans-serif !important;
+}
+[data-testid="stIconMaterial"], .material-symbols-rounded, span[class*="material"] {
+  font-family: 'Material Symbols Rounded' !important;
+}
+.stApp, [data-testid="stSidebar"], [data-testid="stMain"] { direction: rtl; text-align: right; }
+[data-testid="stDataFrame"], [data-testid="stTable"], .js-plotly-plot, code, pre { direction: ltr; text-align: left; }
+[data-testid="stMetricValue"], [data-testid="stMetricDelta"] { direction: ltr; text-align: right; justify-content: flex-end; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] { text-align: right; }
+.stTabs [data-baseweb="tab-list"] { gap: 0.25rem; flex-wrap: wrap; }
+div[data-testid="stExpander"] summary p { font-weight: 600; }
+.bb-chip { display:inline-block; padding:0.1rem 0.55rem; border-radius:999px; font-size:0.8rem; margin-left:0.3rem; }
+.bb-ok { background:#C6EFCE; color:#006100; } .bb-warn { background:#FFEB9C; color:#9C5700; }
+.bb-info { background:#DDEBF7; color:#1F4E78; }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Column mapping UI
+# ---------------------------------------------------------------------------
+def mapping_ui(columns: list[str], detected: MappingResult, key_prefix: str, title: str) -> dict | None:
+    """Selectboxes to map canonical columns; returns the mapping or None if incomplete."""
+    sig = hashlib.md5("|".join(columns).encode()).hexdigest()[:8]
+    opts = [L.MAPPING_NONE, *columns]
+    mapping: dict[str, str | None] = {}
+    with st.expander(f"{L.MAPPING_TITLE} — {title}", expanded=not detected.ok):
+        if not detected.ok:
+            st.warning(L.MAPPING_HELP)
+        grid = st.columns(3)
+        for i, canon in enumerate((*REQUIRED_COLUMNS, *OPTIONAL_COLUMNS)):
+            cur = detected.mapping.get(canon)
+            label = CANON_LABELS[canon] + (" *" if canon in REQUIRED_COLUMNS else "")
+            sel = grid[i % 3].selectbox(label, opts, index=opts.index(cur) if cur in opts else 0,
+                                        key=f"map_{key_prefix}_{canon}_{sig}")
+            mapping[canon] = None if sel == L.MAPPING_NONE else sel
+        st.caption("علامت \\* یعنی ستون الزامی")
+    missing = [c for c in REQUIRED_COLUMNS if not mapping.get(c)]
+    chosen = [v for v in mapping.values() if v]
+    if len(chosen) != len(set(chosen)):
+        st.warning("یک ستون برای بیش از یک مورد انتخاب شده است.")
+    if missing:
+        st.error("ستون‌های الزامی تعیین نشده‌اند: " + "، ".join(missing))
+        return None
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# Sections
+# ---------------------------------------------------------------------------
+def kpi_cards(s: dict, mk: dict | None) -> None:
+    c = st.columns(6)
+    c[0].metric(L.KPI_EVALUATED, fmt_int(s["evaluated"]))
+    c[1].metric(L.KPI_COMPETITIVE, fmt_int(s["comp_rows"]))
+    c[2].metric(L.KPI_COMP_WIN_RATE, fmt_pct(s["comp_win_rate"]),
+                **(delta_args(mk["comp_win_rate_change_pp"]) if mk is not None else {}))
+    c[3].metric(L.KPI_NEAR_MISS, fmt_int(s["near_miss"]))
+    c[4].metric(L.KPI_GAINED, fmt_int(mk["gained"]) if mk else "-")
+    c[5].metric(L.KPI_LOST, fmt_int(mk["lost"]) if mk else "-")
+
+
+def seller_bar_chart(table: pd.DataFrame) -> None:
+    t = table[~table["Is_Total"] & (table["Comp_Variants"] > 0)]
+    t = t.sort_values("Comp_Variants", ascending=False).head(20).copy()
+    if t.empty:
+        st.info("هیچ تنوع رقابتی در داده فیلترشده وجود ندارد.")
+        return
+    t["band"] = pd.cut(t["Comp_Win_Rate"], [-0.01, 0.2999999, 0.6, 1.01], labels=["<30%", "30–60%", ">60%"])
+    t["label"] = t["Seller_Name"].astype(str) + " (" + t["Comp_Variants"].map(fmt_int) + ")"
+    t = t.iloc[::-1]
+    fig = px.bar(t, x="Comp_Win_Rate", y="label", orientation="h", color="band",
+                 color_discrete_map={"<30%": RED, "30–60%": AMBER, ">60%": GREEN},
+                 text=t["Comp_Win_Rate"].map(fmt_pct),
+                 category_orders={"band": ["<30%", "30–60%", ">60%"]})
+    fig.update_layout(height=max(360, 26 * len(t) + 80), margin=dict(l=10, r=10, t=30, b=10),
+                      xaxis=dict(tickformat=".0%", range=[0, 1.08], title="وین‌ریت رقابتی"),
+                      yaxis=dict(title="", categoryorder="array", categoryarray=list(t["label"])),
+                      legend_title_text="", font=dict(family="Vazirmatn, VazirmatnLocal, Tahoma"))
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    st.plotly_chart(fig, width="stretch")
+    st.caption("۲۰ فروشنده با بیشترین تنوع در رقابت (عدد داخل پرانتز). قرمز < ۳۰٪، کهربایی ۳۰ تا ۶۰٪، سبز > ۶۰٪.")
+
+
+def summary_bullets(s: dict, table: pd.DataFrame, mk: dict | None, changes: pd.DataFrame | None,
+                    seller_info: pd.DataFrame, params: Params) -> list[str]:
+    """3–5 bullets built strictly from the computed numbers."""
+    b: list[str] = []
+    line = (f"وین‌ریت رقابتی {fmt_pct(s['comp_win_rate'])} است ({fmt_int(s['comp_wins'])} بای باکس از "
+            f"{fmt_int(s['comp_rows'])} تنوع در رقابت).")
+    if mk is not None and not pd.isna(mk["prev_comp_win_rate"]):
+        line += (f" دوره قبل {fmt_pct(mk['prev_comp_win_rate'])} بود؛ تغییر "
+                 f"{fmt_pp(mk['comp_win_rate_change_pp'])}.")
+    b.append(line)
+    if mk is not None and changes is not None and not changes.empty:
+        b.append(f"{fmt_int(mk['gained'])} بای باکس گرفته شد و {fmt_int(mk['lost'])} از دست رفت؛ "
+                 f"{fmt_int(mk['new'])} تنوع جدید و {fmt_int(mk['removed'])} تنوع حذف‌شده.")
+        winners, losers = compare.net_movers(changes, seller_info, top=1)
+        if not winners.empty:
+            w = winners.iloc[0]
+            b.append(f"بیشترین رشد خالص: {w.Seller_Name} — گرفته {fmt_int(w.Gained)}، از دست رفته "
+                     f"{fmt_int(w.Lost)}، خالص {int(w.Net):+d}.")
+        if not losers.empty:
+            lo = losers.iloc[0]
+            b.append(f"بیشترین افت خالص: {lo.Seller_Name} — گرفته {fmt_int(lo.Gained)}، از دست رفته "
+                     f"{fmt_int(lo.Lost)}، خالص {int(lo.Net):+d}.")
+    data = table[~table["Is_Total"]]
+    if not data.empty and data["Near_Miss"].max() > 0:
+        top = data.sort_values("Near_Miss", ascending=False).iloc[0]
+        b.append(f"بیشترین باخت نزدیک (فاصله ≤ {params.near_miss_threshold * 100:.1f}٪): "
+                 f"{top.Seller_Name} با {fmt_int(top.Near_Miss)} تنوع — از تب Quick Win فایل بفرستید.")
+    if len(b) < 5 and s["margin_flags"]:
+        b.append(f"{fmt_int(s['margin_flags'])} تنوع بازنده برای رسیدن به قیمت هدف بیش از "
+                 f"{params.max_acceptable_cut * 100:.1f}٪ کاهش قیمت لازم دارند (هشدار حاشیه).")
+    if len(b) < 5 and not pd.isna(s["single_seller_group_pct"]):
+        b.append(f"{fmt_pct(s['single_seller_group_pct'])} از گروه‌های DKP + وزن فقط یک فروشنده دارند.")
+    return b[:5]
+
+
+def trend_section(runs: list[history.RunInfo], sellers: list[object]) -> None:
+    st.subheader("روند")
+    tr = history.trend_frame(runs, sellers or None)
+    if len(tr) < 1:
+        st.caption("هنوز اجرای ذخیره‌شده‌ای برای نمایش روند وجود ندارد.")
+        return
+    title = "وین‌ریت رقابتی تجمیعی" + (" (فروشندگان انتخاب‌شده)" if sellers else " (کل بازار)")
+    fig = px.line(tr, x="created_at", y="comp_win_rate", markers=True, hover_data=["run", "comp_rows"])
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=40, b=10), title=title,
+                      yaxis=dict(tickformat=".0%", title=""), xaxis=dict(title=""),
+                      font=dict(family="Vazirmatn, VazirmatnLocal, Tahoma"))
+    st.plotly_chart(fig, width="stretch")
+    st.caption("روند بر اساس اجراهای ذخیره‌شده است (فیلتر KAM/دسته/برند روی روند اعمال نمی‌شود؛ فیلتر فروشنده اعمال می‌شود).")
+
+
+def quality_section(checks, compact: bool) -> None:
+    icons = {STATUS_OK: ("bb-ok", "✓"), STATUS_WARN: ("bb-warn", "!"), "info": ("bb-info", "i")}
+    for chk in checks:
+        cls, ic = icons[chk.status]
+        note = f" — <small>{chk.note}</small>" if chk.note else ""
+        line = f"<span class='bb-chip {cls}'>{ic}</span> {chk.label}: <b dir='ltr'>{chk.display}</b>{note}"
+        if compact or chk.rows is None or chk.rows.empty:
+            st.markdown(line, unsafe_allow_html=True)
+        else:
+            st.markdown(line, unsafe_allow_html=True)
+            with st.expander(f"مشاهده ردیف‌ها — {chk.label}"):
+                st.dataframe(styled(chk.rows.head(5000), ints=("Selling_Price", "BuyBox_Min_Price"),
+                                    weight=("Weight",), ids=("DKPC", "DKP", "Seller_ID", "Group_ID")),
+                             hide_index=True, width="stretch")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    st.set_page_config(layout="wide", page_title=L.APP_TITLE, page_icon="🪙")
+    inject_css()
+    settings = load_settings()
+    runs = history.list_runs(RUNS_DIR)
+
+    sb = st.sidebar
+    sb.markdown(f"### {L.APP_TITLE}")
+    sb.caption(L.APP_SUBTITLE)
+
+    # ---- Files ---------------------------------------------------------------
+    sb.subheader(L.SIDEBAR_FILES)
+    cur_file = sb.file_uploader(L.UPLOAD_CURRENT, type=["xlsx"], key="up_cur")
+    kam_file = sb.file_uploader(L.UPLOAD_KAM, type=["xlsx"], key="up_kam")
+    kam_bytes: bytes | None = None
+    if kam_file is not None:
+        kam_bytes = kam_file.getvalue()
+        try:
+            if not KAM_SAVED.exists() or KAM_SAVED.read_bytes() != kam_bytes:
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                KAM_SAVED.write_bytes(kam_bytes)
+        except OSError:
+            sb.warning("ذخیره لیست KAM روی دیسک ممکن نشد.")
+    elif KAM_SAVED.exists():
+        kam_bytes = KAM_SAVED.read_bytes()
+        sb.caption(L.KAM_SAVED_INFO)
+        if sb.button(L.KAM_SAVED_FORGET, key="forget_kam"):
+            KAM_SAVED.unlink(missing_ok=True)
+            st.rerun()
+
+    cur_bytes = cur_file.getvalue() if cur_file is not None else None
+    cur_hash = file_hash(cur_bytes) if cur_bytes else ""
+    usable_runs = [r for r in runs if r.meta.get("file_hash") != cur_hash]
+    prev_options = [L.PREV_NONE, L.PREV_FILE, L.PREV_RUN]
+    prev_kind = sb.radio(L.PREV_SOURCE, prev_options, index=2 if usable_runs else 0, key="prev_kind")
+    prev_file = None
+    prev_run: history.RunInfo | None = None
+    if prev_kind == L.PREV_FILE:
+        prev_file = sb.file_uploader(L.UPLOAD_PREV, type=["xlsx"], key="up_prev")
+    elif prev_kind == L.PREV_RUN:
+        if usable_runs:
+            by_path = {str(r.parquet): r for r in usable_runs}
+            picked = sb.selectbox(L.SELECT_RUN, list(by_path), format_func=lambda p: by_path[p].label,
+                                  key="sel_run")
+            prev_run = by_path.get(picked)
+        else:
+            sb.caption("هنوز اجرای ذخیره‌شده‌ای (غیر از فایل فعلی) وجود ندارد.")
+
+    # ---- Parameters ----------------------------------------------------------
+    sb.subheader(L.SIDEBAR_PARAMS)
+    thr = sb.slider(L.PARAM_NEAR_MISS, 0.1, 10.0, 1.0, 0.1, key="p_thr")
+    undercut = sb.number_input(L.PARAM_UNDERCUT, min_value=0, value=0, step=10_000, key="p_under",
+                               help=L.PARAM_UNDERCUT_HELP)
+    sb.caption(L.PARAM_UNDERCUT_HELP)
+    max_cut = sb.number_input(L.PARAM_MAX_CUT, min_value=0.0, max_value=100.0, value=1.0, step=0.1,
+                              format="%.1f", key="p_maxcut")
+    params = Params(near_miss_threshold=thr / 100, undercut=float(undercut), max_acceptable_cut=max_cut / 100)
+
+    filters_box = sb.container()
+
+    with sb.expander(L.SIDEBAR_SETTINGS):
+        my_kam = st.text_input(L.SETTINGS_MY_KAM, value=settings.get("my_kam", ""), key="set_kam")
+        autosave = st.checkbox(L.SETTINGS_AUTOSAVE, value=settings.get("autosave", True), key="set_auto")
+        if my_kam != settings.get("my_kam", "") or autosave != settings.get("autosave", True):
+            settings.update(my_kam=my_kam, autosave=autosave)
+            save_settings(settings)
+        st.caption(f"محل ذخیره داده‌ها: {DATA_DIR}")
+        if runs:
+            st.markdown("**تاریخچه اجراها**")
+            run_by_path = {str(r.parquet): r for r in runs}
+            to_del = st.selectbox("حذف اجرا", ["", *run_by_path],
+                                  format_func=lambda p: "—" if not p else run_by_path[p].label, key="del_run")
+            if to_del and st.button("حذف اجرای انتخاب‌شده", key="del_btn"):
+                history.delete_run(run_by_path[to_del])
+                st.rerun()
+
+    # ---- Header --------------------------------------------------------------
+    st.title(L.APP_TITLE)
+    if cur_bytes is None:
+        st.info(L.INFO_UPLOAD_FIRST)
+        st.caption("داده‌ها فقط روی همین کامپیوتر پردازش می‌شوند و به هیچ سرویس بیرونی ارسال نمی‌شوند.")
+        if runs:
+            trend_section(runs, [])
+        return
+
+    # ---- Read + map current file --------------------------------------------
+    try:
+        raw = cached_read(cur_bytes)
+    except InputFileError as exc:
+        st.error(str(exc))
+        return
+    cur_name = cur_file.name
+    mapping = mapping_ui([str(c) for c in raw.columns], detect_columns(list(raw.columns)), "cur", cur_name)
+    if mapping is None:
+        return
+
+    kam_merged = None
+    if kam_bytes:
+        try:
+            kam_merged, kam_warnings = cached_kam(kam_bytes)
+            for w in kam_warnings:
+                st.warning(w)
+        except InputFileError as exc:
+            st.error("لیست KAM: " + str(exc))
+            kam_bytes = None
+
+    params_t = (params.near_miss_threshold, params.undercut, params.max_acceptable_cut)
+    try:
+        analysis = cached_analysis(cur_bytes, cur_name, tuple(sorted(mapping.items())), kam_bytes, params_t)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"خطا در پردازش فایل: {exc}")
+        return
+
+    # ---- Previous period ----------------------------------------------------
+    comparison = None
+    prev_columns: list[str] | None = None
+    if prev_file is not None:
+        try:
+            prev_bytes = prev_file.getvalue()
+            prev_raw = cached_read(prev_bytes)
+            pmap = mapping_ui([str(c) for c in prev_raw.columns], detect_columns(list(prev_raw.columns)),
+                              "prev", prev_file.name)
+            if pmap is not None:
+                prev_an = cached_analysis(prev_bytes, prev_file.name, tuple(sorted(pmap.items())), kam_bytes,
+                                          params_t)
+                prev_columns = prev_an.original_columns
+                comparison = attach_comparison(analysis, prev_an.rows, prev_file.name, prev_columns)
+        except InputFileError as exc:
+            st.error("فایل دوره قبل: " + str(exc))
+    elif prev_run is not None:
+        prev_rows = cached_run(str(prev_run.parquet), prev_run.parquet.stat().st_mtime)
+        prev_columns = prev_run.meta.get("columns")
+        comparison = attach_comparison(analysis, prev_rows, prev_run.label, prev_columns)
+    has_prev = comparison is not None
+
+    # ---- Save run -----------------------------------------------------------
+    if autosave and history.find_run(RUNS_DIR, cur_hash) is None:
+        try:
+            history.save_run(analysis.rows, params, cur_name, RUNS_DIR, file_hash=cur_hash,
+                             original_columns=analysis.original_columns)
+            st.toast("این اجرا در تاریخچه ذخیره شد.")
+            runs = history.list_runs(RUNS_DIR)
+        except OSError as exc:
+            st.warning(f"ذخیره اجرا ممکن نشد: {exc}")
+
+    rows_all = analysis.rows
+    info = analysis.seller_info
+
+    # ---- Filters ------------------------------------------------------------
+    with filters_box:
+        st.subheader(L.SIDEBAR_FILTERS)
+        k_opts = kam_options(info)
+        if "f_kam" not in st.session_state:
+            st.session_state["f_kam"] = [my_kam] if my_kam and my_kam in k_opts else []
+        st.session_state["f_kam"] = [k for k in st.session_state["f_kam"] if k in k_opts]
+        f_kam = st.multiselect(L.FILTER_KAM, k_opts, key="f_kam")
+        f_cat = f_brand = []
+        if "Leaf_Category_Name" in rows_all.columns:
+            cats = sorted(rows_all["Leaf_Category_Name"].dropna().unique().tolist())
+            st.session_state["f_cat"] = [c for c in st.session_state.get("f_cat", []) if c in cats]
+            f_cat = st.multiselect(L.FILTER_CATEGORY, cats, key="f_cat")
+        if "Brand_Name_En" in rows_all.columns:
+            brands = sorted(rows_all["Brand_Name_En"].dropna().unique().tolist())
+            st.session_state["f_brand"] = [b for b in st.session_state.get("f_brand", []) if b in brands]
+            f_brand = st.multiselect(L.FILTER_BRAND, brands, key="f_brand")
+        seller_ids = info.index.tolist()
+        st.session_state["f_seller"] = [s for s in st.session_state.get("f_seller", []) if s in seller_ids]
+        f_seller = st.multiselect(L.FILTER_SELLER, seller_ids, key="f_seller",
+                                  format_func=lambda s: f"{info.at[s, 'Seller_Name']} ({s})")
+
+    mask = filter_mask(rows_all, info, f_kam, f_cat, f_brand, f_seller)
+    rows = rows_all[mask]
+    filtered = not bool(mask.all())
+    if filtered:
+        st.caption(f"فیلتر فعال: {fmt_int(len(rows))} از {fmt_int(len(rows_all))} تنوع.")
+    if rows.empty:
+        st.warning("با فیلترهای انتخاب‌شده هیچ ردیفی باقی نمی‌ماند.")
+        return
+
+    s = market_summary(rows)
+    mk = changes = prev_comp = prev_f = None
+    if has_prev:
+        prev_rows_all = comparison.prev_rows
+        prev_info_mask = filter_mask(prev_rows_all, info, f_kam, f_cat, f_brand, f_seller)
+        prev_f = prev_rows_all[prev_info_mask]
+        removed_f = compare.removed_rows(rows_all, prev_f)
+        mk = compare.market_changes(rows, prev_f, removed_f)
+        changes = compare.seller_changes(rows)
+        prev_comp = compare.prev_comp_by_seller(prev_f)
+    table = seller_metrics(rows, info, prev_comp, changes)
+
+    # ---- Data quality first ---------------------------------------------------
+    checks = run_checks(rows_all, analysis.duplicate_rows, info, kam_merged, analysis.original_columns,
+                        prev_columns)
+    n_warn = sum(c.status == STATUS_WARN for c in checks)
+    with st.expander(f"کیفیت داده — {n_warn} هشدار" if n_warn else "کیفیت داده — بدون هشدار",
+                     expanded=bool(n_warn) and not st.session_state.get("dq_seen")):
+        quality_section(checks, compact=True)
+        st.caption("جزئیات و فهرست ردیف‌ها در تب «کیفیت داده».")
+    st.session_state["dq_seen"] = True
+
+    tabs = st.tabs([L.TAB_SUMMARY, L.TAB_SELLERS, L.TAB_NEAR_MISS, L.TAB_CHANGES, L.TAB_CATEGORY, L.TAB_QUALITY])
+
+    # ---- Tab 1: summary -------------------------------------------------------
+    with tabs[0]:
+        st.info(bidi(L.INFO_COMPETITIVE_KPI.format(single_pct=fmt_pct(s["single_seller_group_pct"]),
+                                              overall=fmt_pct(s["win_rate"]),
+                                              competitive=fmt_pct(s["comp_win_rate"]))))
+        kpi_cards(s, mk)
+        left, right = st.columns([3, 2])
+        with left:
+            seller_bar_chart(table)
+        with right:
+            st.subheader("نکات کلیدی")
+            for bullet in summary_bullets(s, table, mk, changes, info, params):
+                st.markdown(f"- {bidi(bullet)}")
+            st.caption(L.INFO_PRICE_ONLY)
+            st.divider()
+            st.subheader("خروجی اکسل")
+            full_table = seller_metrics(
+                rows_all, info,
+                compare.prev_comp_by_seller(comparison.prev_rows) if has_prev else None,
+                compare.seller_changes(rows_all) if has_prev else None)
+            q_frame = checks_to_frame(checks)
+            raw_full, rows_full = analysis.raw, rows_all
+            prev_label = comparison.prev_label if has_prev else ""
+
+            def _main_xlsx() -> bytes:
+                return build_main_workbook(raw_full, rows_full, full_table, kam_merged, q_frame, params,
+                                           cur_name, has_prev, prev_label)
+
+            st.download_button(L.EXPORT_MAIN, data=_main_xlsx, mime=XLSX_MIME, type="primary",
+                               file_name=f"BuyBox_{safe_filename(Path(cur_name).stem, 120)}.xlsx",
+                               on_click="ignore", key="dl_main")
+            st.caption("فایل اکسل شامل همه داده‌هاست (فیلترها روی آن اعمال نمی‌شوند) و فقط مقدار دارد، نه فرمول.")
+        trend_section(runs, f_seller)
+
+    # ---- Tab 2: sellers -------------------------------------------------------
+    with tabs[1]:
+        show_cols = [c for c in L.SELLER_COLUMNS if c in table.columns]
+        disp = table[show_cols].rename(columns=L.SELLER_COLUMNS)
+        sty = styled(
+            disp,
+            pct=[L.SELLER_COLUMNS[c] for c in ("Win_Rate", "Comp_Win_Rate", "Prev_Comp_Win_Rate",
+                                                 "Median_Loss_Gap", "Share")],
+            ints=[L.SELLER_COLUMNS[c] for c in ("Variants", "Not_Evaluated", "Evaluated", "Wins",
+                                                  "Comp_Variants", "Comp_Wins", "Gained", "Lost",
+                                                  "Single_Seller_Variants", "No_BuyBox", "Near_Miss")],
+            pp=[L.SELLER_COLUMNS["Comp_Win_Rate_Change"]],
+            rate_cols=[L.SELLER_COLUMNS["Comp_Win_Rate"]],
+            change_cols=[L.SELLER_COLUMNS["Comp_Win_Rate_Change"]],
+            ids=["Seller_ID"],
+        )
+        st.caption("برای دیدن جزئیات، روی یک ردیف کلیک کنید یا فروشنده را از فهرست پایین انتخاب کنید. "
+                   "سطر آخر «جمع کل» تجمیعی است.")
+        event = st.dataframe(sty, hide_index=True, width="stretch", on_select="rerun",
+                             selection_mode="single-row", key="seller_table", height=420,
+                             column_config={"Seller_ID": st.column_config.Column(pinned=True),
+                                            "Seller Name": st.column_config.Column(pinned=True)})
+        sel_rows = event.selection.rows if event is not None else []
+        data_ids = table.loc[~table["Is_Total"], "Seller_ID"].tolist()
+        if sel_rows:
+            picked = table.iloc[sel_rows[0]]
+            if not picked["Is_Total"] and st.session_state.get("last_pick") != picked["Seller_ID"]:
+                st.session_state["drill"] = picked["Seller_ID"]
+                st.session_state["last_pick"] = picked["Seller_ID"]
+        if st.session_state.get("drill") not in data_ids:
+            st.session_state.pop("drill", None)
+        sid = st.selectbox("فروشنده برای جزئیات", data_ids, key="drill",
+                           format_func=lambda x: f"{info.at[x, 'Seller_Name']} ({x})")
+        if sid is not None:
+            seller_drilldown(rows, table, sid, info, params, mk is not None)
+
+    # ---- Tab 3: near misses -----------------------------------------------------
+    with tabs[2]:
+        nm = rows[rows["Near_Miss"]]
+        st.caption(f"باخت نزدیک: تنوع بازنده‌ای که فاصله قیمتش تا بای باکس بیشتر از صفر و حداکثر "
+                   f"{thr:.1f}٪ است. {L.PARAM_UNDERCUT_HELP}")
+        if nm.empty:
+            st.info("در داده فیلترشده باخت نزدیکی وجود ندارد.")
+        else:
+            counts = (nm.groupby("Seller_ID").agg(n=("DKPC", "size"),
+                                                   flags=("Margin_Flag", lambda x: int((x != "").sum())))
+                      .sort_values("n", ascending=False))
+            st.markdown(f"**{fmt_int(len(nm))} باخت نزدیک در {fmt_int(len(counts))} فروشنده**")
+            for seller_id, rec in counts.iterrows():
+                name = info.at[seller_id, "Seller_Name"] if seller_id in info.index else str(seller_id)
+                srows = nm[nm["Seller_ID"] == seller_id].sort_values("Gap_to_BuyBox")
+                with st.expander(f"{name} — {fmt_int(rec.n)} تنوع" +
+                                 (f" (هشدار حاشیه: {rec.flags})" if rec.flags else "")):
+                    st.dataframe(row_table(srows), hide_index=True, width="stretch")
+
+                    def _qw(r=srows, n=name) -> bytes:
+                        return build_quickwin_workbook(r, n, params)
+
+                    st.download_button(f"{L.EXPORT_QUICKWIN} — {name}", data=_qw, mime=XLSX_MIME,
+                                       file_name=quickwin_filename(name), on_click="ignore",
+                                       key=f"qw_{seller_id}")
+
+    # ---- Tab 4: changes -----------------------------------------------------------
+    with tabs[3]:
+        if not has_prev:
+            st.info(L.INFO_NO_PREV)
+        else:
+            changes_tab(rows, prev_f, comparison, mk, changes, info, rows_all)
+
+    # ---- Tab 5: category & brand -----------------------------------------------------
+    with tabs[4]:
+        category_tab(rows)
+
+    # ---- Tab 6: data quality ---------------------------------------------------------
+    with tabs[5]:
+        quality_section(checks, compact=False)
+
+
+def seller_drilldown(rows: pd.DataFrame, table: pd.DataFrame, sid: object, info: pd.DataFrame,
+                     params: Params, has_prev: bool) -> None:
+    rec = table[(~table["Is_Total"]) & (table["Seller_ID"] == sid)].iloc[0]
+    srows = rows[rows["Seller_ID"] == sid]
+    st.markdown(f"#### {rec.Seller_Name}  ·  KAM: {rec.KAM}")
+    c = st.columns(6)
+    c[0].metric("تنوع فعال", fmt_int(rec.Variants))
+    c[1].metric("تنوع در رقابت", fmt_int(rec.Comp_Variants))
+    c[2].metric("وین‌ریت رقابتی", fmt_pct(rec.Comp_Win_Rate),
+                **(delta_args(rec.Comp_Win_Rate_Change) if has_prev and "Comp_Win_Rate_Change" in rec else {}))
+    c[3].metric("باخت نزدیک", fmt_int(rec.Near_Miss))
+    c[4].metric("بای باکس گرفته", fmt_int(rec.Gained) if has_prev else "-")
+    c[5].metric("بای باکس از دست رفته", fmt_int(rec.Lost) if has_prev else "-")
+
+    l, r = st.columns([1, 2])
+    with l:
+        st.markdown("**باخت به چه کسی؟ (۵ رقیب اول در تنوع‌های رقابتی)**")
+        ltw = compare.lost_to_whom(rows, sid)
+        if ltw.empty:
+            st.caption("باخت رقابتی ندارد.")
+        else:
+            st.dataframe(styled(ltw.rename(columns={"BuyBox_Winner_Seller": "برنده بای باکس", "Count": "تعداد"}),
+                                ints=("تعداد",)), hide_index=True, width="stretch")
+    with r:
+        nm = srows[srows["Near_Miss"]].sort_values("Gap_to_BuyBox")
+        st.markdown(f"**باخت‌های نزدیک ({fmt_int(len(nm))})**")
+        if nm.empty:
+            st.caption("باخت نزدیکی ندارد.")
+        else:
+            st.dataframe(row_table(nm), hide_index=True, width="stretch", height=250)
+    lost = srows[srows["Is_Loss"]].sort_values("Gap_to_BuyBox")
+    st.markdown(f"**همه بای باکس‌های ازدست‌رفته ({fmt_int(len(lost))})** — "
+                "ستون Margin_Flag نشان می‌دهد کاهش قیمت لازم از حد قابل قبول بیشتر است.")
+    if not lost.empty:
+        extra = ("Competition_Type", "BuyBox_Change") if "BuyBox_Change" in lost.columns else ("Competition_Type",)
+        st.dataframe(row_table(lost, extra), hide_index=True, width="stretch", height=320)
+
+
+def changes_tab(rows, prev_f, comparison, mk, changes, info, rows_all) -> None:
+    st.caption(f"مقایسه با: {comparison.prev_label} (تطبیق بر اساس DKPC)")
+    c = st.columns(6)
+    c[0].metric(L.KPI_GAINED, fmt_int(mk["gained"]))
+    c[1].metric(L.KPI_LOST, fmt_int(mk["lost"]))
+    c[2].metric(L.KPI_NEW, fmt_int(mk["new"]))
+    c[3].metric(L.KPI_REMOVED, fmt_int(mk["removed"]))
+    c[4].metric("وین‌ریت رقابتی دوره قبل", fmt_pct(mk["prev_comp_win_rate"]))
+    c[5].metric("وین‌ریت رقابتی فعلی", fmt_pct(mk["cur_comp_win_rate"]), **delta_args(mk["comp_win_rate_change_pp"]))
+
+    winners, losers = compare.net_movers(changes, info)
+    a, b = st.columns(2)
+    rename = {"Seller_Name": "فروشنده", "Gained": "گرفته", "Lost": "از دست رفته", "Net": "خالص"}
+    with a:
+        st.markdown("**۵ برنده خالص اول**")
+        st.dataframe(styled(winners.rename(columns=rename), ints=("گرفته", "از دست رفته", "خالص"),
+                            ids=("Seller_ID",)), hide_index=True, width="stretch")
+    with b:
+        st.markdown("**۵ بازنده خالص اول**")
+        st.dataframe(styled(losers.rename(columns=rename), ints=("گرفته", "از دست رفته", "خالص"),
+                            ids=("Seller_ID",)), hide_index=True, width="stretch")
+
+    st.markdown("**تغییرات به تفکیک فروشنده**")
+    prev_comp = compare.prev_comp_by_seller(prev_f)
+    t = changes.join(prev_comp.add_prefix("Prev_"), how="left")
+    cur_comp = rows.assign(_c=rows["Is_Competitive"].astype(int),
+                           _w=(rows["Is_Competitive"] & rows["Is_Win"]).astype(int)).groupby("Seller_ID")[["_c", "_w"]].sum()
+    t["Prev_Rate"] = t["Prev_Comp_Wins"] / t["Prev_Comp_Variants"].where(t["Prev_Comp_Variants"] > 0)
+    t["Cur_Rate"] = cur_comp["_w"] / cur_comp["_c"].where(cur_comp["_c"] > 0)
+    t["Change_pp"] = (t["Cur_Rate"] - t["Prev_Rate"]) * 100
+    t["Seller_Name"] = info["Seller_Name"].reindex(t.index)
+    t = t.reset_index()[["Seller_ID", "Seller_Name", "Prev_Rate", "Cur_Rate", "Change_pp", "Gained", "Lost", "Net", "New"]]
+    t = t.sort_values(["Net", "Lost"], ascending=[True, False])
+    st.dataframe(styled(t.rename(columns={"Seller_Name": "فروشنده", "Prev_Rate": "وین‌ریت رقابتی قبل",
+                                          "Cur_Rate": "وین‌ریت رقابتی فعلی", "Change_pp": "تغییر",
+                                          "Gained": "گرفته", "Lost": "از دست رفته", "Net": "خالص",
+                                          "New": "تنوع جدید"}),
+                        pct=("وین‌ریت رقابتی قبل", "وین‌ریت رقابتی فعلی"), pp=("تغییر",),
+                        ints=("گرفته", "از دست رفته", "خالص", "تنوع جدید"), change_cols=("تغییر",),
+                        ids=("Seller_ID",)),
+                 hide_index=True, width="stretch", height=380)
+
+    st.markdown("**ردیف‌های تغییرکرده**")
+    kinds = [L.CHANGE_GAINED, L.CHANGE_LOST, L.CHANGE_NEW, L.CHANGE_NO_WEIGHT, L.CHANGE_SAME, L.CHANGE_BAD_PRICE]
+    pick = st.multiselect("نوع تغییر", kinds, default=[L.CHANGE_GAINED, L.CHANGE_LOST], key="chg_kinds")
+    ch_rows = rows[rows["BuyBox_Change"].isin(pick)]
+    cols = [c for c in ("DKPC", "DKP", "Seller_Name", "Product_Name", "Weight", "Selling_Price", "BuyBox_Min_Price",
+                        "BuyBox_Winner_Seller", "Comment_Prev_File", "Comment", "BuyBox_Change") if c in ch_rows.columns]
+    st.caption(f"{fmt_int(len(ch_rows))} ردیف (حداکثر ۵٬۰۰۰ ردیف نمایش داده می‌شود)")
+    st.dataframe(styled(ch_rows[cols].head(5000), ints=("Selling_Price", "BuyBox_Min_Price"), weight=("Weight",),
+                        ids=("DKPC", "DKP")), hide_index=True, width="stretch", height=360)
+
+    removed = compare.removed_rows(rows_all, prev_f)
+    st.markdown(f"**تنوع‌های حذف‌شده (در فایل قبل بودند، در فایل فعلی نیستند): {fmt_int(len(removed))}**")
+    if not removed.empty:
+        st.dataframe(styled(removed.head(5000), ints=("Selling_Price",), weight=("Weight",),
+                            ids=("DKPC", "DKP", "Seller_ID")), hide_index=True, width="stretch", height=300)
+
+
+def category_tab(rows: pd.DataFrame) -> None:
+    rename = {"Variants": "تعداد تنوع", "Evaluated": "ارزیابی‌شده", "Comp_Variants": "تنوع در رقابت",
+              "Comp_Wins": "بای باکس در رقابت", "Comp_Win_Rate": "وین‌ریت رقابتی",
+              "Median_Loss_Gap": "میانه فاصله باخت‌ها", "Near_Miss": "باخت نزدیک", "Sellers": "تعداد فروشنده"}
+    ints = ("تعداد تنوع", "ارزیابی‌شده", "تنوع در رقابت", "بای باکس در رقابت", "باخت نزدیک", "تعداد فروشنده")
+    a, b = st.columns(2)
+    for box, col, title in ((a, "Leaf_Category_Name", "به تفکیک دسته‌بندی"), (b, "Brand_Name_En", "به تفکیک برند")):
+        with box:
+            st.markdown(f"**{title}**")
+            t = rate_by_dimension(rows, col)
+            if t.empty:
+                st.caption(f"ستون {col} در فایل نیست.")
+                continue
+            st.dataframe(styled(t.rename(columns=rename), pct=("وین‌ریت رقابتی", "میانه فاصله باخت‌ها"),
+                                ints=ints, rate_cols=("وین‌ریت رقابتی",)),
+                         hide_index=True, width="stretch", height=360)
+    st.markdown("**گروه‌های تک‌فروشنده — DKPهای پرتنوع (کاندید جذب فروشنده دوم)**")
+    t = single_seller_dkps(rows, top=50)
+    if t.empty:
+        st.caption("گروه تک‌فروشنده‌ای وجود ندارد.")
+    else:
+        st.dataframe(styled(t.rename(columns={"Variants": "تنوع تک‌فروشنده", "Weights": "تعداد وزن",
+                                              "Sellers": "فروشنده(ها)"}),
+                            ints=("تنوع تک‌فروشنده", "تعداد وزن"), ids=("DKP",)),
+                     hide_index=True, width="stretch", height=380)
+
+
+if __name__ == "__main__":
+    main()

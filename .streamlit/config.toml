@@ -1,0 +1,20 @@
+[server]
+# Local only: the data is internal and must not leave this computer.
+address = "localhost"
+port = 8501
+headless = true
+enableStaticServing = true
+maxUploadSize = 300
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+serverAddress = "localhost"
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#1F4E78"
+font = "sans-serif"

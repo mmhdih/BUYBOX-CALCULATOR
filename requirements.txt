@@ -1,0 +1,8 @@
+streamlit>=1.50
+pandas>=2.2
+openpyxl>=3.1
+xlsxwriter>=3.2
+pyarrow>=16
+plotly>=5.22
+python-calamine>=0.3
+pytest>=8
