@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Create this tag (e.g. v1.0) on the run's commit and publish a release with the zip (leave empty to only build)"
+        required: false
+        default: ""
 
 permissions:
   contents: write  # needed only to attach the zip to a GitHub release on v* tags
@@ -62,8 +67,23 @@ jobs:
           path: dist/BuyBoxAnalyzer
           retention-days: 30
 
-      - name: Attach zip to release (tags only)
+      - name: Attach zip to release (v* tag push)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          files: dist/BuyBoxAnalyzer_portable_win64.zip
+
+      - name: Create tag + release (manual run with release_tag)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Buy Box Analyzer ${{ inputs.release_tag }}
+          body: |
+            نسخه پرتابل ویندوز (۶۴ بیتی) — بدون نیاز به نصب.
+            1. فایل `BuyBoxAnalyzer_portable_win64.zip` را دانلود و کامل Extract کنید.
+            2. روی `BuyBox.bat` دوبار کلیک کنید؛ مرورگر خودکار باز می‌شود.
+
+            Portable Windows x64 build: extract the zip and double-click `BuyBox.bat`.
           files: dist/BuyBoxAnalyzer_portable_win64.zip
