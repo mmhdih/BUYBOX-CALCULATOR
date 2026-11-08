@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import re
+import warnings
 import zipfile
 from dataclasses import dataclass, field
 
@@ -74,6 +76,18 @@ def _read_excel(data: bytes, sheet_name: str | int = 0) -> pd.DataFrame:
         return pd.read_excel(buf, sheet_name=sheet_name, engine="openpyxl")
 
 
+def _clean_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop fully empty rows and unnamed empty columns that exports sometimes leave behind."""
+    if df.empty:
+        raise InputFileError(L.ERR_FILE_EMPTY)
+    df = df.dropna(how="all")
+    df = df.loc[:, ~(df.columns.astype(str).str.startswith("Unnamed") & df.isna().all())]
+    if df.empty:
+        raise InputFileError(L.ERR_FILE_EMPTY)
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+    return df.reset_index(drop=True)
+
+
 def read_excel_bytes(data: bytes, sheet_name: str | int = 0) -> pd.DataFrame:
     """Read one sheet of an .xlsx file given as bytes, raising InputFileError on failure."""
     if not data:
@@ -84,14 +98,92 @@ def read_excel_bytes(data: bytes, sheet_name: str | int = 0) -> pd.DataFrame:
         raise InputFileError(L.ERR_FILE_LOCKED) from exc
     except (zipfile.BadZipFile, ValueError, KeyError, OSError, Exception) as exc:  # noqa: BLE001
         raise InputFileError(L.ERR_FILE_MALFORMED.format(detail=type(exc).__name__)) from exc
-    if df.empty:
+    return _clean_frame(df)
+
+
+#: Encodings tried in order for CSV files (UTF-8 with/without BOM, then Windows Persian/Arabic).
+CSV_ENCODINGS = ("utf-8-sig", "cp1256", "cp1252")
+CSV_DELIMITERS = (",", ";", "\t", "|")
+
+
+def _sniff_delimiter(sample: str) -> str:
+    """Pick the delimiter that splits the first lines most consistently."""
+    lines = [ln for ln in sample.splitlines()[:50] if ln.strip()]
+    if not lines:
+        return ","
+    try:
+        return csv.Sniffer().sniff("\n".join(lines), delimiters="".join(CSV_DELIMITERS)).delimiter
+    except csv.Error:
+        counts = {d: lines[0].count(d) for d in CSV_DELIMITERS}
+        best = max(counts, key=counts.get)
+        return best if counts[best] else ","
+
+
+def _numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert text columns that hold numbers (Persian digits, ``1,234``, ``0,5``) to numeric.
+
+    pandas already parses plain numbers; only text columns are checked, first on a sample so
+    large files with genuine text columns stay fast.
+    """
+    for c in df.columns:
+        col = df[c]
+        if pd.api.types.is_numeric_dtype(col):
+            continue
+        non_null = col.dropna()
+        non_null = non_null[non_null.astype("string").str.strip() != ""]
+        if non_null.empty:
+            continue
+        if to_number(non_null.head(500)).isna().any():  # clearly text
+            continue
+        num = to_number(col)
+        if num[non_null.index].notna().all():
+            valid = num.dropna()
+            df[c] = num.astype("Int64") if (valid % 1 == 0).all() and valid.abs().max() < 2**53 else num
+    return df
+
+
+def read_csv_bytes(data: bytes) -> pd.DataFrame:
+    """Read a CSV export, raising InputFileError on failure.
+
+    Encoding (UTF-8 with/without BOM, then Windows-1256/1252) and delimiter (, ; tab |)
+    are detected; Persian digits and thousands separators in numbers are handled.
+    """
+    if not data or not data.strip():
         raise InputFileError(L.ERR_FILE_EMPTY)
-    # Drop fully empty rows and unnamed empty columns that Excel sometimes leaves behind.
-    df = df.dropna(how="all")
-    df = df.loc[:, ~(df.columns.astype(str).str.startswith("Unnamed") & df.isna().all())]
-    if df.empty:
-        raise InputFileError(L.ERR_FILE_EMPTY)
-    return df.reset_index(drop=True)
+    head = data[:200_000]
+    if len(data) > len(head):  # cut at a line end so a multi-byte character is not split
+        head = head[: head.rfind(b"\n") + 1] or head
+    last_error: Exception | None = None
+    for enc in CSV_ENCODINGS:
+        try:
+            sep = _sniff_delimiter(head.decode(enc))
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", pd.errors.ParserWarning)  # rows that lose data
+                df = pd.read_csv(io.BytesIO(data), sep=sep, encoding=enc, skipinitialspace=True,
+                                 low_memory=False, index_col=False)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+        except (pd.errors.ParserError, pd.errors.ParserWarning, pd.errors.EmptyDataError, ValueError,
+                csv.Error) as exc:
+            raise InputFileError(L.ERR_CSV_MALFORMED.format(detail=type(exc).__name__)) from exc
+        return _numeric_columns(_clean_frame(df))
+    raise InputFileError(L.ERR_CSV_ENCODING.format(detail=type(last_error).__name__))
+
+
+def is_csv(data: bytes, filename: str = "") -> bool:
+    """CSV when the name says so, or when the content is not an xlsx (zip) container."""
+    name = filename.lower()
+    if name.endswith(".csv") or name.endswith(".txt"):
+        return True
+    if name.endswith((".xlsx", ".xlsm")):
+        return False
+    return not data[:2] == b"PK"
+
+
+def read_table_bytes(data: bytes, filename: str = "") -> pd.DataFrame:
+    """Read an assortment file (.xlsx first sheet, or .csv)."""
+    return read_csv_bytes(data) if is_csv(data, filename) else read_excel_bytes(data)
 
 
 def list_sheets(data: bytes) -> list[str]:
@@ -112,11 +204,36 @@ def detect_columns(columns: list[object]) -> MappingResult:
     return MappingResult(mapping=mapping, missing_required=missing)
 
 
+_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩٫", "01234567890123456789.")
+
+
+_THOUSANDS = r"^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$"   # 1,234,567(.89)
+_DECIMAL_COMMA = r"^[+-]?\d+,\d+$"                 # 0,5  (decimal comma)
+
+
+def to_number(series: pd.Series) -> pd.Series:
+    """Numeric conversion tolerant of Persian/Arabic digits, spaces and separators.
+
+    A comma is a thousands separator only in ``1,234,567`` form; otherwise a single comma
+    between digits (``0,5``) is a decimal comma.
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        return series.astype("float64")
+    s = series.astype("string").str.translate(_DIGITS)
+    s = s.str.replace("[\\s\u066c\u200c\u00a0]", "", regex=True)
+    thousands = s.str.match(_THOUSANDS).fillna(False)
+    decimal_comma = ~thousands & s.str.match(_DECIMAL_COMMA).fillna(False)
+    s = s.mask(thousands, s.str.replace(",", "", regex=False))
+    s = s.mask(decimal_comma, s.str.replace(",", ".", regex=False))
+    return pd.to_numeric(s.replace("", pd.NA), errors="coerce").astype("float64")
+
+
 def normalize_id(series: pd.Series) -> pd.Series:
     """Normalize an ID column: integer IDs become Int64, anything else a stripped string."""
     s = series.copy()
     if s.dtype == object or pd.api.types.is_string_dtype(s):
-        s = s.astype("string").str.strip().replace("", pd.NA)
+        s = s.astype("string").str.strip().str.translate(_DIGITS).replace("", pd.NA)
+        s = s.str.replace(r"\.0+$", "", regex=True)  # "123.0" from CSV/Excel -> "123"
     num = pd.to_numeric(s, errors="coerce")
     non_null = s.notna()
     if (num.notna() == non_null).all():
@@ -142,9 +259,7 @@ def build_work_frame(raw: pd.DataFrame, mapping: dict[str, str | None]) -> pd.Da
         if canon in ("DKPC", "DKP", "Seller_ID"):
             work[canon] = normalize_id(col)
         elif canon in ("Weight", "Selling_Price", "True_Wage"):
-            if col.dtype == object:
-                col = col.astype("string").str.replace(",", "", regex=False).str.strip()
-            work[canon] = pd.to_numeric(col, errors="coerce").astype("float64")
+            work[canon] = to_number(col)
         else:
             work[canon] = col.astype("string").str.strip().replace("", pd.NA)
     return work
@@ -164,15 +279,18 @@ def parse_actual_buybox(series: pd.Series) -> pd.Series:
 # ---------------------------------------------------------------------------
 # KAM list
 # ---------------------------------------------------------------------------
-def read_kam_list(data: bytes) -> tuple[pd.DataFrame, list[str]]:
-    """Read the KAM list ('KA Selection' sheet) and return (normalized frame, warnings)."""
+def read_kam_list(data: bytes, filename: str = "") -> tuple[pd.DataFrame, list[str]]:
+    """Read the KAM list ('KA Selection' sheet of an .xlsx, or a .csv) -> (normalized frame, warnings)."""
     warnings: list[str] = []
-    sheets = list_sheets(data)
-    target = next((s for s in sheets if normalize_name(s) == normalize_name(KAM_SHEET)), None)
-    if target is None:
-        target = sheets[0]
-        warnings.append(L.WARN_KAM_SHEET.format(sheet=target))
-    df = read_excel_bytes(data, sheet_name=target)
+    if is_csv(data, filename):
+        df = read_csv_bytes(data)
+    else:
+        sheets = list_sheets(data)
+        target = next((s for s in sheets if normalize_name(s) == normalize_name(KAM_SHEET)), None)
+        if target is None:
+            target = sheets[0]
+            warnings.append(L.WARN_KAM_SHEET.format(sheet=target))
+        df = read_excel_bytes(data, sheet_name=target)
     norm = {normalize_name(c): c for c in reversed(list(df.columns))}
     out = pd.DataFrame(index=df.index)
     for canon, aliases in KAM_COLUMNS.items():

@@ -2,7 +2,7 @@
 
 The result is a folder (and a .zip of it) that runs on any 64-bit Windows 10/11 PC with
 no installation and no admin rights: it contains the official *embeddable* Python, all
-dependencies, the app and a ``BuyBox.bat`` launcher.
+dependencies, the app and a native ``BuyBox.exe`` launcher (with icon).
 
 Runs on Windows, Linux or macOS (dependencies are fetched as win_amd64 wheels):
 
@@ -15,6 +15,7 @@ Needs internet access to python.org (unless --embed-zip is given) and to PyPI.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -31,48 +32,26 @@ EMBED_URL = "https://www.python.org/ftp/python/{v}/python-{v}-embed-amd64.zip"
 #: Files/folders of the repository copied into <package>/app
 APP_ITEMS = ("app.py", "launch.py", "buybox", "static", ".streamlit", "README.md")
 
-BAT = r"""@echo off
-setlocal
-chcp 65001 >nul
-title Buy Box Analyzer
-cd /d "%~dp0"
-if not exist "python\python.exe" (
-  echo [!] python\python.exe was not found.
-  echo     Extract the WHOLE zip file first, then run BuyBox.bat from the extracted folder.
-  pause
-  exit /b 1
-)
-set PYTHONUTF8=1
-set PYTHONIOENCODING=utf-8
-echo Starting Buy Box Analyzer ... the browser will open automatically.
-echo Keep this window open while you work. Close it to stop the app.
-"python\python.exe" "app\launch.py"
-if errorlevel 1 (
-  echo.
-  echo [!] The app stopped with an error. See the messages above.
-  pause
-)
-"""
-
 README_PORTABLE = """تحلیل بای باکس شمش و سکه — نسخه پرتابل ویندوز
 ==================================================
 
 اجرا:
   1. کل فایل zip را در یک پوشه Extract کنید (مثلاً روی دسکتاپ یا فلش).
-  2. روی BuyBox.bat دوبار کلیک کنید.
-  3. مرورگر خودکار باز می‌شود (اگر نشد، آدرس نمایش‌داده‌شده در پنجره سیاه را باز کنید؛ معمولاً http://localhost:8642).
-     پورت پیش‌فرض 8642 است تا با اپ‌های دیگر مثل DK ATP (پورت 8501) تداخل نداشته باشد؛
-     اگر اشغال باشد، پورت آزاد بعدی انتخاب می‌شود.
-  4. برای بستن برنامه، پنجره سیاه را ببندید.
+  2. روی BuyBox.exe دوبار کلیک کنید. مرورگر خودکار باز می‌شود و پنجره سیاه کوچک می‌شود (Minimize).
+  3. برای بستن برنامه: دکمه «بستن برنامه» در نوار کناری اپ، یا بستن پنجره Buy Box Analyzer در نوار وظیفه.
+  اگر برنامه از قبل باز باشد، اجرای دوباره BuyBox.exe فقط همان را در مرورگر باز می‌کند.
 
 نکات:
   - نیازی به نصب پایتون یا دسترسی ادمین نیست.
+  - پورت پیش‌فرض 8642 است (نه 8501) تا با اپ‌های دیگر مثل DK ATP تداخل نداشته باشد؛
+    اگر اشغال باشد، پورت آزاد بعدی انتخاب می‌شود.
   - داده‌ها فقط روی همین کامپیوتر پردازش می‌شوند و به اینترنت ارسال نمی‌شوند.
+  - فایل‌های xlsx و csv تا ۵۰۰ مگابایت پشتیبانی می‌شوند.
   - تاریخچه اجراها، تنظیمات و آخرین لیست KAM در پوشه app\\data ذخیره می‌شوند.
     برای انتقال به نسخه جدید، همین پوشه data را کپی کنید.
-  - اگر ویندوز هشدار SmartScreen داد: More info ← Run anyway.
+  - BuyBox.exe امضای دیجیتال ندارد؛ اگر ویندوز هشدار SmartScreen داد: More info ← Run anyway.
 
-Portable Windows build. Double-click BuyBox.bat. Data stays on this PC (app\\data).
+Portable Windows build. Double-click BuyBox.exe (port 8642). Data stays on this PC (app\\data).
 """
 
 
@@ -135,6 +114,30 @@ def slim(site: Path) -> None:
     if bin_dir.exists():
         shutil.rmtree(bin_dir, ignore_errors=True)
     log(f"slimmed: removed {removed} test folders")
+
+
+LAUNCHER_DIR = ROOT / "portable" / "launcher"
+
+
+def build_launcher(dest: Path) -> None:
+    """Compile BuyBox.exe (C + icon/version resources) with zig's cross-compiling C compiler.
+
+    Works on Windows, Linux and macOS: ``pip install ziglang`` provides the compiler.
+    """
+    try:
+        import ziglang  # noqa: F401
+    except ImportError:
+        log("installing the ziglang C compiler (pip install ziglang)")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "ziglang"],
+                       check=True)
+    cache = dest.parent.parent / ".zig-cache"
+    env = {**os.environ, "ZIG_LOCAL_CACHE_DIR": str(cache), "ZIG_GLOBAL_CACHE_DIR": str(cache)}
+    cmd = [sys.executable, "-m", "ziglang", "cc", "-target", "x86_64-windows-gnu", "-O2", "-municode", "-s",
+           "launcher.c", "buybox.rc", "-o", str(dest)]
+    log("compiling BuyBox.exe")
+    subprocess.run(cmd, check=True, cwd=LAUNCHER_DIR, env=env)
+    if not dest.exists() or dest.read_bytes()[:2] != b"MZ":
+        raise SystemExit("BuyBox.exe was not produced.")
 
 
 def copy_app(app_dir: Path) -> None:
@@ -206,7 +209,7 @@ def main() -> int:
         slim(site)
 
     copy_app(pkg / "app")
-    (pkg / "BuyBox.bat").write_bytes(BAT.replace("\n", "\r\n").encode("utf-8"))
+    build_launcher(pkg / "BuyBox.exe")
     (pkg / "README_PORTABLE.txt").write_bytes(README_PORTABLE.replace("\n", "\r\n").encode("utf-8-sig"))
     precompile(pkg)
 

@@ -41,26 +41,42 @@ jobs:
       - name: Smoke test with the embedded Python
         run: dist\BuyBoxAnalyzer\python\python.exe portable\smoke_test.py dist\BuyBoxAnalyzer\app
 
-      - name: Start the app with the launcher and check health
+      - name: Run BuyBox.exe (port 8642 next to another app on 8501, single instance, clean shutdown)
         shell: pwsh
         run: |
           $env:BUYBOX_NO_BROWSER = "1"
-          # occupy 8501 like another Streamlit app (DK ATP) would, to prove there is no clash
+          $env:BUYBOX_NO_MINIMIZE = "1"
+          $exe = (Resolve-Path "dist\BuyBoxAnalyzer\BuyBox.exe").Path
+          if ((Get-Item $exe).VersionInfo.ProductName -ne "Buy Box Analyzer") { throw "version resource missing" }
+          # another Streamlit app (e.g. DK ATP) on 8501
           $other = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, 8501); $other.Start()
-          $p = Start-Process -FilePath "dist\BuyBoxAnalyzer\python\python.exe" -ArgumentList "dist\BuyBoxAnalyzer\app\launch.py" -PassThru -RedirectStandardOutput launch.out -RedirectStandardError launch.err
+          $p = Start-Process -FilePath $exe -PassThru
           $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
-            try {
-              $r = Invoke-WebRequest -UseBasicParsing http://localhost:8642/_stcore/health -TimeoutSec 3
-              if ($r.Content -eq "ok") { $ok = $true; break }
-            } catch {}
+            try { if ((Invoke-WebRequest -UseBasicParsing http://localhost:8642/_stcore/health -TimeoutSec 3).Content -eq "ok") { $ok = $true; break } } catch {}
           }
-          Get-Content launch.out, launch.err -ErrorAction SilentlyContinue
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw "BuyBox.exe did not start the app on port 8642" }
+          $marker = (Invoke-WebRequest -UseBasicParsing http://localhost:8642/app/static/buybox_id.txt).Content.Trim()
+          if ($marker -ne "buybox-analyzer") { throw "unexpected app on 8642: $marker" }
+          Write-Host "OK: app running on 8642 while 8501 is taken"
+
+          # second launch must not start another copy
+          $p2 = Start-Process -FilePath $exe -PassThru; $null = $p2.Handle
+          if (-not $p2.WaitForExit(60000)) { throw "second BuyBox.exe did not exit (started another copy?)" }
+          if ($p2.ExitCode -ne 0) { throw "second BuyBox.exe exit code $($p2.ExitCode)" }
+          Write-Host "OK: second launch reused the running app"
+
+          # killing the launcher must stop the app (job object), leaving nothing behind
+          Stop-Process -Id $p.Id -Force
+          Start-Sleep -Seconds 5
+          $alive = $true
+          try { Invoke-WebRequest -UseBasicParsing http://localhost:8642/_stcore/health -TimeoutSec 3 | Out-Null } catch { $alive = $false }
+          $left = Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*BuyBoxAnalyzer*" }
           $other.Stop()
-          if (-not $ok) { throw "app did not become healthy on the default port 8642" }
-          Write-Host "App started OK"
+          if ($alive -or $left) { throw "app kept running after BuyBox.exe was closed" }
+          Write-Host "OK: closing BuyBox.exe stopped the app"
+          Remove-Item "dist\BuyBoxAnalyzer\app\data\.instance.json" -ErrorAction SilentlyContinue
 
       - name: Upload portable package
         uses: actions/upload-artifact@v4
@@ -85,7 +101,8 @@ jobs:
           body: |
             نسخه پرتابل ویندوز (۶۴ بیتی) — بدون نیاز به نصب.
             1. فایل `BuyBoxAnalyzer_portable_win64.zip` را دانلود و کامل Extract کنید.
-            2. روی `BuyBox.bat` دوبار کلیک کنید؛ مرورگر خودکار باز می‌شود.
+            2. روی `BuyBox.exe` دوبار کلیک کنید؛ مرورگر خودکار باز می‌شود (پورت 8642).
+            3. برای بستن: دکمه «بستن برنامه» در نوار کناری اپ.
 
-            Portable Windows x64 build: extract the zip and double-click `BuyBox.bat`.
+            Portable Windows x64 build: extract the zip and double-click `BuyBox.exe`.
           files: dist/BuyBoxAnalyzer_portable_win64.zip

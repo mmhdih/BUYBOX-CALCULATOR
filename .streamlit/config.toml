@@ -5,7 +5,9 @@ address = "localhost"
 port = 8642
 headless = true
 enableStaticServing = true
-maxUploadSize = 300
+# Assortment / KAM files up to 500 MB (xlsx or csv).
+maxUploadSize = 500
+maxMessageSize = 500
 fileWatcherType = "none"
 
 [browser]

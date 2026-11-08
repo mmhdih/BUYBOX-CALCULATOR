@@ -119,3 +119,37 @@ def lost_to_whom(rows: pd.DataFrame, seller_id: object, top: int = 5) -> pd.Data
     m = (rows["Seller_ID"] == seller_id) & rows["Is_Competitive"].astype(bool) & rows["Is_Loss"].astype(bool)
     vc = rows.loc[m, "BuyBox_Winner_Seller"].value_counts().head(top)
     return vc.rename_axis("BuyBox_Winner_Seller").reset_index(name="Count")
+
+
+def seller_change_table(rows: pd.DataFrame, prev_rows: pd.DataFrame, changes: pd.DataFrame,
+                        seller_info: pd.DataFrame) -> pd.DataFrame:
+    """Per seller: previous / current competitive win rate, change (pp), gained, lost, net, new.
+
+    Sorted with the biggest net losers first.
+    """
+    prev = prev_comp_by_seller(prev_rows)
+    cur = comp_by_seller(rows)
+    t = changes.join(prev.add_prefix("Prev_"), how="left")
+    t["Prev_Rate"] = t["Prev_Comp_Wins"] / t["Prev_Comp_Variants"].where(t["Prev_Comp_Variants"] > 0)
+    cur = cur.reindex(t.index)
+    t["Cur_Rate"] = cur["Comp_Wins"] / cur["Comp_Variants"].where(cur["Comp_Variants"] > 0)
+    t["Change_pp"] = (t["Cur_Rate"] - t["Prev_Rate"]) * 100
+    t["Seller_Name"] = seller_info["Seller_Name"].reindex(t.index)
+    cols = ["Seller_ID", "Seller_Name", "Prev_Rate", "Cur_Rate", "Change_pp", "Gained", "Lost", "Net", "New"]
+    return t.reset_index()[cols].sort_values(["Net", "Lost"], ascending=[True, False]).reset_index(drop=True)
+
+
+def lost_to_whom_all(rows: pd.DataFrame, seller_info: pd.DataFrame, top: int = 5) -> pd.DataFrame:
+    """For every seller, the top buy-box winners against its competitive losing rows."""
+    m = rows["Is_Competitive"].astype(bool) & rows["Is_Loss"].astype(bool)
+    lost = rows.loc[m, ["Seller_ID", "BuyBox_Winner_Seller"]]
+    if lost.empty:
+        return pd.DataFrame(columns=["Seller_ID", "Seller_Name", "BuyBox_Winner_Seller", "Count", "Share"])
+    counts = lost.groupby(["Seller_ID", "BuyBox_Winner_Seller"]).size().rename("Count").reset_index()
+    totals = counts.groupby("Seller_ID")["Count"].transform("sum")
+    counts["Share"] = counts["Count"] / totals
+    counts["_total"] = totals
+    counts = counts.sort_values(["_total", "Seller_ID", "Count"], ascending=[False, True, False])
+    counts = counts.groupby("Seller_ID", sort=False).head(top)
+    counts["Seller_Name"] = counts["Seller_ID"].map(seller_info["Seller_Name"])
+    return counts[["Seller_ID", "Seller_Name", "BuyBox_Winner_Seller", "Count", "Share"]].reset_index(drop=True)

@@ -32,7 +32,7 @@ def _build(has_prev=True):
 
 def test_workbook_structure_and_values():
     cur, wb = _build()
-    assert wb.sheetnames == ["BuyBox_Seller_Report", "Sheet1", "KAM_LIST", "Data_Quality"]
+    assert wb.sheetnames == ["BuyBox_Seller_Report", "Sheet1", "KAM_LIST", "Data_Quality", "راهنما"]
     assert wb["BuyBox_Seller_Report"].sheet_view.rightToLeft
     ws = wb["Sheet1"]
     header = [c.value for c in ws[1]]
@@ -43,7 +43,8 @@ def test_workbook_structure_and_values():
         "Competition_Type", "Comment", "BuyBox_Winner_Seller", "Target_Price", "Required_Cut_%",
         "Margin_Flag", "Comment_Prev_File", "BuyBox_Change"]
     assert ws.max_row == len(CUR) + 1
-    assert ws.freeze_panes == "A2"
+    assert ws.freeze_panes == "B2"  # header row + DKPC column
+    assert ws.cell(1, header.index("Gap_to_BuyBox") + 1).comment is not None  # explanatory tooltip
     assert ws["A1"].fill.fgColor.rgb.endswith("1F4E78")
     assert ws.cell(1, header.index("BuyBox_Change") + 1).fill.fgColor.rgb.endswith("7F6000")
     # values, not formulas
@@ -77,14 +78,29 @@ def test_quickwin_workbook():
     a = run([(1, 1, 10, 1, 100, "A"), (2, 1, 20, 1, 101, "B/C")])
     nm = a.rows[a.rows["Near_Miss"]]
     data = build_quickwin_workbook(nm, "B/C", Params())
-    assert len(read_excel_bytes(data)) == 1
     wb = openpyxl.load_workbook(io.BytesIO(data))
-    header = [c.value for c in wb.active[1]]
-    assert header == ["DKPC", "DKP", "Weight", "Selling_Price", "BuyBox_Min_Price", "Gap", "Target_Price",
-                      "Required_Cut_%", "Margin_Flag"]  # Product_Name absent in this input
-    assert wb.active.cell(2, 1).value == 2
+    ws = wb["QuickWin"]
+    assert ws.sheet_view.rightToLeft
+    (table,) = ws.tables.values()  # an Excel table with filter buttons
+    first = ws[table.ref.split(":")[0]]
+    header = [c.value for c in ws[first.row]]
+    header = [h for h in header if h]
+    # Persian title + the English name required by the spec, in each header cell
+    assert [h.split("\n")[1] for h in header] == ["DKPC", "DKP", "Weight", "Selling_Price", "BuyBox_Min_Price",
+                                                  "Gap", "Target_Price", "Required_Cut_%", "Margin_Flag"]
+    assert header[0] == "شناسه تنوع\nDKPC"
+    assert ws.cell(first.row + 1, 1).value == 2
     name = quickwin_filename("B/C")
     assert name.startswith("QuickWin_B_C_") and name.endswith(".xlsx")
+
+
+def test_main_workbook_splits_rows_beyond_sheet_limit(monkeypatch):
+    import buybox.export as ex
+    monkeypatch.setattr(ex, "MAX_SHEET_ROWS", 4)
+    cur, wb = _build()
+    assert [n for n in wb.sheetnames if n.startswith("Sheet1")] == ["Sheet1", "Sheet1 (2)", "Sheet1 (3)"]
+    total = sum(wb[n].max_row - 1 for n in wb.sheetnames if n.startswith("Sheet1"))
+    assert total == len(cur.rows)
 
 
 def test_roundtrip_through_excel_reader():

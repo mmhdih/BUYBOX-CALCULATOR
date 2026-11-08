@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
+import os
 import re
 import sys
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -39,16 +42,18 @@ from buybox.io import (  # noqa: E402
     MappingResult,
     detect_columns,
     merge_kam,
-    read_excel_bytes,
     read_kam_list,
+    read_table_bytes,
 )
 from buybox.pipeline import Analysis, analyze, attach_comparison, filter_mask, kam_options  # noqa: E402
 from buybox.quality import STATUS_OK, STATUS_WARN, checks_to_frame, run_checks  # noqa: E402
+from buybox.report import ReportContext, build_report, report_filename  # noqa: E402
 
 DATA_DIR = APP_DIR / "data"
 RUNS_DIR = DATA_DIR / "runs"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 KAM_SAVED = DATA_DIR / "kam_list_last.xlsx"
+UPLOAD_TYPES = ["xlsx", "csv"]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 RED, AMBER, GREEN = "#D64545", "#E8A33D", "#3A9D5D"
@@ -93,28 +98,41 @@ def save_settings(settings: dict) -> None:
 # ---------------------------------------------------------------------------
 # Cached computation (keyed on file bytes + parameters)
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="در حال خواندن فایل اکسل…", max_entries=6)
-def cached_read(data: bytes) -> pd.DataFrame:
-    return read_excel_bytes(data)
+# Large files (up to 500 MB) are cached by content hash: the bytes themselves are passed in
+# underscore-prefixed arguments, which Streamlit does not hash, and results are kept with
+# st.cache_resource (shared, not copied on every rerun). Cached frames are never mutated.
+@st.cache_resource(show_spinner="در حال خواندن فایل…", max_entries=4)
+def cached_read(key: str, name: str, _src) -> pd.DataFrame:
+    """_src: an uploaded file (bytes read only on a cache miss) or bytes."""
+    return read_table_bytes(_src.getvalue() if hasattr(_src, "getvalue") else _src, name)
 
 
 @st.cache_data(show_spinner="در حال خواندن لیست KAM…", max_entries=4)
-def cached_kam(data: bytes) -> tuple[pd.DataFrame, list[str]]:
-    kam, warnings = read_kam_list(data)
+def cached_kam(key: str, name: str, _data: bytes) -> tuple[pd.DataFrame, list[str]]:
+    kam, warnings = read_kam_list(_data, name)
     return merge_kam(kam), warnings
 
 
-@st.cache_data(show_spinner="در حال محاسبه بای باکس…", max_entries=6)
-def cached_analysis(data: bytes, name: str, mapping_items: tuple, kam_bytes: bytes | None,
-                    params: tuple[float, float, float]) -> Analysis:
-    raw = cached_read(data)
-    kam = cached_kam(kam_bytes)[0] if kam_bytes else None
+@st.cache_resource(show_spinner="در حال محاسبه بای باکس…", max_entries=4)
+def cached_analysis(key: str, name: str, mapping_items: tuple, kam_key: str, params: tuple[float, float, float],
+                    _src, _kam: tuple[str, bytes] | None) -> Analysis:
+    raw = cached_read(key, name, _src)
+    kam = cached_kam(kam_key, _kam[0], _kam[1])[0] if _kam else None
     return analyze(raw, dict(mapping_items), kam, Params(*params), name)
 
 
-@st.cache_data(show_spinner="در حال بارگذاری اجرای ذخیره‌شده…", max_entries=4)
+@st.cache_resource(show_spinner="در حال بارگذاری اجرای ذخیره‌شده…", max_entries=4)
 def cached_run(path: str, mtime: float) -> pd.DataFrame:  # mtime only busts the cache
     return history.load_run(history.RunInfo(Path(path), {}))
+
+
+def upload_key(f) -> str:
+    """Content hash of an uploaded file, computed once per upload (not on every rerun)."""
+    memo = st.session_state.setdefault("_upload_hashes", {})
+    fid = getattr(f, "file_id", None) or f"{f.name}:{f.size}"
+    if fid not in memo:
+        memo[fid] = file_hash(f.getvalue())
+    return memo[fid]
 
 
 def file_hash(data: bytes) -> str:
@@ -151,7 +169,7 @@ def fmt_weight(v: object) -> str:
     return "-" if v is None or pd.isna(v) else f"{float(v):g}"
 
 
-_NUM_RE = re.compile(r"([+\-−]?\d[\d,]*(?:\.\d+)?(?:\s?(?:%|pp))?)")
+_NUM_RE = re.compile(r"(?<![\w\-−.,٫/:])([+\-−]?[0-9][0-9,٬]*(?:[.٫][0-9]+)?(?:\s?(?:%|٪|pp))?)(?![\w\-/:])")
 
 
 def bidi(text: str) -> str:
@@ -311,7 +329,7 @@ button, .stTabs [data-baseweb="tab"], [data-testid="stMetricLabel"], [data-testi
 /* file uploader: Persian texts instead of Streamlit's English ones */
 .stApp [data-testid="stFileUploaderDropzoneInstructions"] * { display: none !important; }
 .stApp [data-testid="stFileUploaderDropzoneInstructions"]::after {
-  content: "فایل xlsx — حداکثر ۳۰۰ مگابایت"; font-size: 0.8rem; color: #6B7280; }
+  content: "xlsx یا csv — حداکثر ۵۰۰ مگابایت"; font-size: 0.8rem; color: #6B7280; }
 .stApp [data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"] > * { display: none !important; }
 .stApp [data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"]::after {
   content: "انتخاب فایل"; font-size: 0.9rem; }
@@ -495,11 +513,13 @@ def main() -> None:
 
     # ---- Files ---------------------------------------------------------------
     sb.subheader(L.SIDEBAR_FILES)
-    cur_file = sb.file_uploader(L.UPLOAD_CURRENT, type=["xlsx"], key="up_cur")
-    kam_file = sb.file_uploader(L.UPLOAD_KAM, type=["xlsx"], key="up_kam")
+    cur_file = sb.file_uploader(L.UPLOAD_CURRENT, type=UPLOAD_TYPES, key="up_cur")
+    kam_file = sb.file_uploader(L.UPLOAD_KAM, type=UPLOAD_TYPES, key="up_kam")
     kam_bytes: bytes | None = None
+    kam_name = ""  # empty name -> format detected from content (remembered list may be xlsx or csv)
     if kam_file is not None:
         kam_bytes = kam_file.getvalue()
+        kam_name = kam_file.name
         try:
             if not KAM_SAVED.exists() or KAM_SAVED.read_bytes() != kam_bytes:
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -513,15 +533,14 @@ def main() -> None:
             KAM_SAVED.unlink(missing_ok=True)
             st.rerun()
 
-    cur_bytes = cur_file.getvalue() if cur_file is not None else None
-    cur_hash = file_hash(cur_bytes) if cur_bytes else ""
+    cur_hash = upload_key(cur_file) if cur_file is not None else ""
     usable_runs = [r for r in runs if r.meta.get("file_hash") != cur_hash]
     prev_options = [L.PREV_NONE, L.PREV_FILE, L.PREV_RUN]
     prev_kind = sb.radio(L.PREV_SOURCE, prev_options, index=2 if usable_runs else 0, key="prev_kind")
     prev_file = None
     prev_run: history.RunInfo | None = None
     if prev_kind == L.PREV_FILE:
-        prev_file = sb.file_uploader(L.UPLOAD_PREV, type=["xlsx"], key="up_prev")
+        prev_file = sb.file_uploader(L.UPLOAD_PREV, type=UPLOAD_TYPES, key="up_prev")
     elif prev_kind == L.PREV_RUN:
         if usable_runs:
             by_path = {str(r.parquet): r for r in usable_runs}
@@ -559,9 +578,16 @@ def main() -> None:
                 history.delete_run(run_by_path[to_del])
                 st.rerun()
 
+    if os.environ.get("BUYBOX_LAUNCHER"):  # started by BuyBox.exe / launch.py
+        if sb.button(L.SHUTDOWN, key="shutdown", icon=":material/power_settings_new:", width="stretch"):
+            sb.success(L.SHUTDOWN_DONE)
+            st.success(L.SHUTDOWN_DONE)
+            threading.Timer(1.5, os._exit, args=(0,)).start()
+            st.stop()
+
     # ---- Header --------------------------------------------------------------
     st.title(L.APP_TITLE)
-    if cur_bytes is None:
+    if cur_file is None:
         st.info(L.INFO_UPLOAD_FIRST)
         st.caption("داده‌ها فقط روی همین کامپیوتر پردازش می‌شوند و به هیچ سرویس بیرونی ارسال نمی‌شوند.")
         if runs:
@@ -570,7 +596,7 @@ def main() -> None:
 
     # ---- Read + map current file --------------------------------------------
     try:
-        raw = cached_read(cur_bytes)
+        raw = cached_read(cur_hash, cur_file.name, cur_file)
     except InputFileError as exc:
         st.error(str(exc))
         return
@@ -580,9 +606,10 @@ def main() -> None:
         return
 
     kam_merged = None
+    kam_key = file_hash(kam_bytes) if kam_bytes else ""
     if kam_bytes:
         try:
-            kam_merged, kam_warnings = cached_kam(kam_bytes)
+            kam_merged, kam_warnings = cached_kam(kam_key, kam_name, kam_bytes)
             for w in kam_warnings:
                 st.warning(w)
         except InputFileError as exc:
@@ -591,7 +618,10 @@ def main() -> None:
 
     params_t = (params.near_miss_threshold, params.undercut, params.max_acceptable_cut)
     try:
-        analysis = cached_analysis(cur_bytes, cur_name, tuple(sorted(mapping.items())), kam_bytes, params_t)
+        analysis = cached_analysis(cur_hash, cur_name, tuple(sorted(mapping.items())), kam_key, params_t,
+                                   cur_file, (kam_name, kam_bytes) if kam_bytes else None)
+        # cached object is shared: work on a shallow copy so adding comparison columns never leaks
+        analysis = dataclasses.replace(analysis, rows=analysis.rows.copy(deep=False))
     except Exception as exc:  # noqa: BLE001
         st.error(f"خطا در پردازش فایل: {exc}")
         return
@@ -601,13 +631,14 @@ def main() -> None:
     prev_columns: list[str] | None = None
     if prev_file is not None:
         try:
-            prev_bytes = prev_file.getvalue()
-            prev_raw = cached_read(prev_bytes)
+            prev_key = upload_key(prev_file)
+            prev_raw = cached_read(prev_key, prev_file.name, prev_file)
             pmap = mapping_ui([str(c) for c in prev_raw.columns], detect_columns(list(prev_raw.columns)),
                               "prev", prev_file.name)
             if pmap is not None:
-                prev_an = cached_analysis(prev_bytes, prev_file.name, tuple(sorted(pmap.items())), kam_bytes,
-                                          params_t)
+                prev_an = cached_analysis(prev_key, prev_file.name, tuple(sorted(pmap.items())), kam_key,
+                                          params_t, prev_file,
+                                          (kam_name, kam_bytes) if kam_bytes else None)
                 prev_columns = prev_an.original_columns
                 comparison = attach_comparison(analysis, prev_an.rows, prev_file.name, prev_columns)
         except InputFileError as exc:
@@ -684,10 +715,22 @@ def main() -> None:
         st.caption("جزئیات و فهرست ردیف‌ها در تب «کیفیت داده».")
     st.session_state["dq_seen"] = True
 
+    bullets = summary_bullets(s, table, mk, changes, info, params)
+    ctx = ReportContext(
+        input_name=cur_name, params=params, rows=rows, seller_info=info, table=table, summary=s,
+        bullets=bullets, checks=checks, kam_merged=kam_merged,
+        prev_label=comparison.prev_label if has_prev else "", prev_rows=prev_f,
+        removed=removed_f if has_prev else None, mk=mk, changes=changes,
+        filters={"KAM": f_kam, "دسته‌بندی": f_cat, "برند": f_brand,
+                 "فروشنده": [str(info.at[x, "Seller_Name"]) for x in f_seller]},
+    )
+    export_bar(ctx, analysis, rows_all, info, kam_merged, checks, comparison, params, cur_name, filtered)
+
     tabs = st.tabs([L.TAB_SUMMARY, L.TAB_SELLERS, L.TAB_NEAR_MISS, L.TAB_CHANGES, L.TAB_CATEGORY, L.TAB_QUALITY])
 
     # ---- Tab 1: summary -------------------------------------------------------
     with tabs[0]:
+        tab_export(ctx, "summary")
         st.info(bidi(L.INFO_COMPETITIVE_KPI.format(single_pct=fmt_pct(s["single_seller_group_pct"]),
                                               overall=fmt_pct(s["win_rate"]),
                                               competitive=fmt_pct(s["comp_win_rate"]))))
@@ -697,31 +740,14 @@ def main() -> None:
             seller_bar_chart(table)
         with right:
             st.subheader("نکات کلیدی")
-            for bullet in summary_bullets(s, table, mk, changes, info, params):
+            for bullet in bullets:
                 st.markdown(f"- {bidi(bullet)}")
             st.caption(L.INFO_PRICE_ONLY)
-            st.divider()
-            st.subheader("خروجی اکسل")
-            full_table = seller_metrics(
-                rows_all, info,
-                compare.prev_comp_by_seller(comparison.prev_rows) if has_prev else None,
-                compare.seller_changes(rows_all) if has_prev else None)
-            q_frame = checks_to_frame(checks)
-            raw_full, rows_full = analysis.raw, rows_all
-            prev_label = comparison.prev_label if has_prev else ""
-
-            def _main_xlsx() -> bytes:
-                return build_main_workbook(raw_full, rows_full, full_table, kam_merged, q_frame, params,
-                                           cur_name, has_prev, prev_label)
-
-            st.download_button(L.EXPORT_MAIN, data=_main_xlsx, mime=XLSX_MIME, type="primary",
-                               file_name=f"BuyBox_{safe_filename(Path(cur_name).stem, 120)}.xlsx",
-                               on_click="ignore", key="dl_main")
-            st.caption("فایل اکسل شامل همه داده‌هاست (فیلترها روی آن اعمال نمی‌شوند) و فقط مقدار دارد، نه فرمول.")
         trend_section(runs, f_seller)
 
     # ---- Tab 2: sellers -------------------------------------------------------
     with tabs[1]:
+        tab_export(ctx, "sellers")
         show_cols = [c for c in L.SELLER_COLUMNS if c in table.columns]
         disp = table[show_cols].rename(columns=L.SELLER_COLUMNS)
         sort_opts = {L.SELLER_COLUMNS[c]: c for c in show_cols if c not in ("Seller_ID", "Seller_Name", "KAM", "Main_Brand")}
@@ -757,6 +783,7 @@ def main() -> None:
 
     # ---- Tab 3: near misses -----------------------------------------------------
     with tabs[2]:
+        tab_export(ctx, "near_miss")
         nm = rows[rows["Near_Miss"]]
         st.caption(f"باخت نزدیک: تنوع بازنده‌ای که فاصله قیمتش تا بای باکس بیشتر از صفر و حداکثر "
                    f"{thr:.1f}٪ است. {L.PARAM_UNDERCUT_HELP}")
@@ -784,6 +811,7 @@ def main() -> None:
 
     # ---- Tab 4: changes -----------------------------------------------------------
     with tabs[3]:
+        tab_export(ctx, "changes")
         if not has_prev:
             st.info(L.INFO_NO_PREV)
         else:
@@ -791,11 +819,49 @@ def main() -> None:
 
     # ---- Tab 5: category & brand -----------------------------------------------------
     with tabs[4]:
+        tab_export(ctx, "category")
         category_tab(rows)
 
     # ---- Tab 6: data quality ---------------------------------------------------------
     with tabs[5]:
+        tab_export(ctx, "quality")
         quality_section(checks, compact=False)
+
+
+def export_bar(ctx: ReportContext, analysis: Analysis, rows_all: pd.DataFrame, info: pd.DataFrame,
+               kam_merged, checks, comparison, params: Params, cur_name: str, filtered: bool) -> None:
+    """Top export bar: full styled report (all tabs) + the standard BuyBox_<file>.xlsx."""
+    has_prev = comparison is not None
+    with st.container(border=True):
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.download_button(L.EXPORT_ALL, data=lambda: build_report(ctx), mime=XLSX_MIME, type="primary",
+                               file_name=report_filename(cur_name), on_click="ignore", key="dl_all",
+                               width="stretch")
+            st.caption(L.EXPORT_ALL_HELP + (" (فیلترهای فعلی اعمال شده‌اند.)" if filtered else ""))
+        with c2:
+            def _std() -> bytes:
+                full_table = seller_metrics(
+                    rows_all, info,
+                    compare.prev_comp_by_seller(comparison.prev_rows) if has_prev else None,
+                    compare.seller_changes(rows_all) if has_prev else None)
+                return build_main_workbook(analysis.raw, rows_all, full_table, kam_merged, checks_to_frame(checks),
+                                           params, cur_name, has_prev, comparison.prev_label if has_prev else "")
+
+            st.download_button(L.EXPORT_MAIN, data=_std, mime=XLSX_MIME, on_click="ignore", key="dl_main",
+                               file_name=f"BuyBox_{safe_filename(Path(cur_name).stem, 120)}.xlsx", width="stretch")
+            st.caption(L.EXPORT_MAIN_HELP)
+        if len(rows_all) > 300_000:
+            st.caption(bidi(f"فایل بزرگ است ({fmt_int(len(rows_all))} ردیف)؛ ساخت اکسل ممکن است چند دقیقه طول بکشد. "
+                            "ردیف‌های بیش از ۱٬۰۰۰٬۰۰۰ در چند شیت پشت سر هم نوشته می‌شوند."))
+
+
+def tab_export(ctx: ReportContext, tab: str) -> None:
+    """Small per-tab download button (left side of the tab header row)."""
+    _, right = st.columns([4, 1])
+    right.download_button(L.EXPORT_TAB, data=lambda: build_report(ctx, [tab]), mime=XLSX_MIME,
+                          file_name=report_filename(ctx.input_name, tab), on_click="ignore",
+                          key=f"dl_tab_{tab}", icon=":material/download:", width="stretch")
 
 
 def seller_drilldown(rows: pd.DataFrame, table: pd.DataFrame, sid: object, info: pd.DataFrame,
@@ -859,16 +925,7 @@ def changes_tab(rows, prev_f, comparison, mk, changes, info, rows_all) -> None:
                             ids=("Seller_ID",))
 
     st.markdown("**تغییرات به تفکیک فروشنده**")
-    prev_comp = compare.prev_comp_by_seller(prev_f)
-    t = changes.join(prev_comp.add_prefix("Prev_"), how="left")
-    cur_comp = rows.assign(_c=rows["Is_Competitive"].astype(int),
-                           _w=(rows["Is_Competitive"] & rows["Is_Win"]).astype(int)).groupby("Seller_ID")[["_c", "_w"]].sum()
-    t["Prev_Rate"] = t["Prev_Comp_Wins"] / t["Prev_Comp_Variants"].where(t["Prev_Comp_Variants"] > 0)
-    t["Cur_Rate"] = cur_comp["_w"] / cur_comp["_c"].where(cur_comp["_c"] > 0)
-    t["Change_pp"] = (t["Cur_Rate"] - t["Prev_Rate"]) * 100
-    t["Seller_Name"] = info["Seller_Name"].reindex(t.index)
-    t = t.reset_index()[["Seller_ID", "Seller_Name", "Prev_Rate", "Cur_Rate", "Change_pp", "Gained", "Lost", "Net", "New"]]
-    t = t.sort_values(["Net", "Lost"], ascending=[True, False])
+    t = compare.seller_change_table(rows, prev_f, changes, info)
     rtl_table(t.rename(columns={"Seller_Name": "فروشنده", "Prev_Rate": "وین‌ریت رقابتی قبل",
                                           "Cur_Rate": "وین‌ریت رقابتی فعلی", "Change_pp": "تغییر",
                                           "Gained": "گرفته", "Lost": "از دست رفته", "Net": "خالص",
