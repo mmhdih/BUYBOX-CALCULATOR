@@ -303,6 +303,18 @@ button, .stTabs [data-baseweb="tab"], [data-testid="stMetricLabel"], [data-testi
   font-family: 'Material Symbols Rounded' !important;
 }
 /* ---------- right-to-left layout ---------- */
+/* Sidebar sits on the right in RTL, but Streamlit collapses it by sliding it LEFT
+   (translateX(-width)), which drops its text into the middle of the page. Instead, shrink it
+   in place against the right edge and clip its content. */
+[data-testid="stSidebar"][data-collapsed="true"] {
+  transform: none !important; overflow: hidden !important;
+}
+[data-testid="stSidebar"][data-collapsed="true"] [data-testid="stSidebarContent"] {
+  visibility: hidden; transition: visibility 0s linear 0.3s;
+}
+/* collapse / expand arrows point the RTL way */
+[data-testid="stSidebarCollapseButton"] button > *, [data-testid="stExpandSidebarButton"] > *,
+[data-testid="stExpandSidebarButton"] button > * { transform: scaleX(-1); }
 .stApp, [data-testid="stSidebar"], [data-testid="stMain"], [data-testid="stBottom"] { direction: rtl; }
 /* Streamlit sets text-align:left on these; force right */
 .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
